@@ -26,6 +26,8 @@
 static constexpr uint8_t DB_COIN{'C'};
 static constexpr uint8_t DB_BEST_BLOCK{'B'};
 static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
+// Below 'c' on purpose: NeedsUpgrade() treats any key at or after the legacy 'c' as an old database.
+static constexpr uint8_t DB_SWIFTSYNC{'W'};
 // Keys used in previous version that might still be found in the DB:
 static constexpr uint8_t DB_COINS{'c'};
 
@@ -97,6 +99,13 @@ uint256 CCoinsViewDB::GetBestBlock() const {
     return hashBestChain;
 }
 
+std::optional<std::vector<unsigned char>> CCoinsViewDB::GetSwiftSyncState() const
+{
+    std::vector<unsigned char> state;
+    if (!m_db->Read(DB_SWIFTSYNC, state)) return std::nullopt;
+    return state;
+}
+
 std::vector<uint256> CCoinsViewDB::GetHeadBlocks() const {
     std::vector<uint256> vhashHeadBlocks;
     if (!m_db->Read(DB_HEAD_BLOCKS, vhashHeadBlocks)) {
@@ -154,6 +163,12 @@ bool CCoinsViewDB::BatchWrite(CoinsViewCacheCursor& cursor, const uint256 &hashB
                 }
             }
         }
+    }
+
+    // SwiftSync's aggregate describes the coins as of hashBlock, so it goes in the same batch.
+    if (m_swiftsync_pending) {
+        batch.Write(DB_SWIFTSYNC, *m_swiftsync_pending);
+        m_swiftsync_pending.reset();
     }
 
     // In the last batch, mark the database as consistent with hashBlock again.

@@ -45,6 +45,7 @@
 #include <util/strencodings.h>
 #include <util/time.h>
 #include <util/trace.h>
+#include <swiftsync.h>
 #include <validation.h>
 
 #include <algorithm>
@@ -710,6 +711,14 @@ private:
 
     /** Send a single `sendheaders` message, after we have completed headers sync with a peer. */
     void MaybeSendSendHeaders(CNode& node, Peer& peer) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** SwiftSync: ask a manually added peer for the undo data of blocks we will connect soon. */
+    void MaybeRequestSwiftSyncUndo(CNode& node) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    /** SwiftSync undo requests in flight: block hash -> (peer, time asked). */
+    std::map<uint256, std::pair<NodeId, std::chrono::seconds>> m_swiftsync_inflight GUARDED_BY(cs_main);
+    /** SwiftSync: peers that have answered (served undo), and how many requests each got unanswered. */
+    std::set<NodeId> m_swiftsync_servers GUARDED_BY(cs_main);
+    std::map<NodeId, int> m_swiftsync_unanswered GUARDED_BY(cs_main);
 
     /** Relay (gossip) an address to a few randomly chosen nodes.
      *
@@ -1603,8 +1612,48 @@ void PeerManagerImpl::ReattemptInitialBroadcast(CScheduler& scheduler)
     scheduler.scheduleFromNow([&] { ReattemptInitialBroadcast(scheduler); }, delta);
 }
 
+void PeerManagerImpl::MaybeRequestSwiftSyncUndo(CNode& node)
+{
+    // How far ahead of the tip to fetch, and how many requests one peer may have open.
+    static constexpr int WINDOW{256};
+    static constexpr int PER_PEER{32};
+    static constexpr std::chrono::seconds TIMEOUT{60};
+    if (!node.IsManualConn()) return;
+    LOCK(cs_main);
+    auto* const sw{swiftsync::g_swiftsync.get()};
+    if (!sw || sw->Done()) return;
+    const NodeId id{node.GetId()};
+    // A peer that never answers doesn't serve undo data: after a few tries, stop asking it.
+    if (!m_swiftsync_servers.contains(id) && m_swiftsync_unanswered[id] >= 4) return;
+    const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+    const CBlockIndex* best{m_chainman.m_best_header};
+    if (!tip || !best) return;
+    const auto now{GetTime<std::chrono::seconds>()};
+    int open{0};
+    for (auto it{m_swiftsync_inflight.begin()}; it != m_swiftsync_inflight.end();) {
+        if (now - it->second.second > TIMEOUT) {
+            if (it->second.first == id) ++m_swiftsync_unanswered[id];
+            it = m_swiftsync_inflight.erase(it);
+            continue;
+        }
+        if (it->second.first == id) ++open;
+        ++it;
+    }
+    const int last{std::min({sw->GetHints().Height(), best->nHeight, tip->nHeight + WINDOW})};
+    for (int h = tip->nHeight + 1; h <= last && open < PER_PEER; ++h) {
+        const CBlockIndex* pindex{best->GetAncestor(h)};
+        if (!pindex) break;
+        const uint256 hash{pindex->GetBlockHash()};
+        if (sw->Undo().Have(hash) || m_swiftsync_inflight.contains(hash)) continue;
+        m_swiftsync_inflight.emplace(hash, std::make_pair(id, now));
+        ++open;
+        MakeAndPushMessage(node, NetMsgType::GETSWUNDO, hash);
+    }
+}
+
 void PeerManagerImpl::FinalizeNode(const CNode& node)
 {
+    WITH_LOCK(cs_main, m_swiftsync_servers.erase(node.GetId()); m_swiftsync_unanswered.erase(node.GetId()));
     NodeId nodeid = node.GetId();
     {
     LOCK(cs_main);
@@ -4198,6 +4247,60 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         return;
     }
 
+    if (msg_type == NetMsgType::GETSWUNDO) {
+        // SwiftSync: serve one block's undo data (the coins its inputs spend) from our active chain.
+        uint256 hash;
+        vRecv >> hash;
+        if (m_connman.OutboundTargetReached(/*historicalBlockServingLimit=*/true) &&
+            !pfrom.HasPermission(NetPermissionFlags::Download)) {
+            return;
+        }
+        const CBlockIndex* pindex{nullptr};
+        {
+            LOCK(cs_main);
+            pindex = m_chainman.m_blockman.LookupBlockIndex(hash);
+            if (!pindex || !(pindex->nStatus & BLOCK_HAVE_UNDO) || !m_chainman.ActiveChain().Contains(pindex)) {
+                LogDebug(BCLog::NET, "Peer %d asked for undo data we don't have\n", pfrom.GetId());
+                return;
+            }
+        }
+        CBlockUndo undo;
+        if (!m_chainman.m_blockman.ReadBlockUndo(undo, *pindex)) return;
+        MakeAndPushMessage(pfrom, NetMsgType::SWUNDO, hash, undo);
+        return;
+    }
+
+    if (msg_type == NetMsgType::SWUNDO) {
+        uint256 hash;
+        CBlockUndo undo;
+        vRecv >> hash >> undo;
+        bool resume{false};
+        {
+            LOCK(cs_main);
+            auto* const sw{swiftsync::g_swiftsync.get()};
+            auto it{m_swiftsync_inflight.find(hash)};
+            if (!sw || sw->Done() || it == m_swiftsync_inflight.end() || it->second.first != pfrom.GetId()) return; // unasked
+            m_swiftsync_inflight.erase(it);
+            m_swiftsync_servers.insert(pfrom.GetId());
+            m_swiftsync_unanswered.erase(pfrom.GetId());
+            const CBlockIndex* pindex{m_chainman.m_blockman.LookupBlockIndex(hash)};
+            if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash)) return;
+            if (!sw->Undo().Write(hash, undo)) {
+                LogWarning("SwiftSync: cannot store undo data for %s\n", hash.ToString());
+                return;
+            }
+            const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+            resume = tip && pindex->pprev == tip && (pindex->nStatus & BLOCK_HAVE_DATA);
+        }
+        if (resume) {
+            BlockValidationState state;
+            if (!m_chainman.ActiveChainstate().ActivateBestChain(state)) {
+                LogDebug(BCLog::NET, "SwiftSync: activation after undo data failed: %s\n", state.ToString());
+            }
+        }
+        return;
+    }
+
     if (msg_type == NetMsgType::GETBLOCKTXN) {
         BlockTransactionsRequest req;
         vRecv >> req;
@@ -5598,6 +5701,8 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 
     // MaybeSendPing may have marked peer for disconnection
     if (pto->fDisconnect) return true;
+
+    MaybeRequestSwiftSyncUndo(*pto);
 
     MaybeSendAddr(*pto, *peer, current_time);
 

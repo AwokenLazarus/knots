@@ -320,6 +320,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   stats/rpc_stats.cpp
   stats/stats.cpp
   torcontrol.cpp
+  swiftsync.cpp
   txdb.cpp
   txmempool.cpp
   txorphanage.cpp

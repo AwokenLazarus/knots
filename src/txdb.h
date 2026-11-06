@@ -47,6 +47,8 @@ protected:
     Mutex m_db_mutex;
     std::unique_ptr<CDBWrapper> m_db;
     std::shared_future<void> m_compaction;
+    //! SwiftSync state to write in the same batch as the next coins flush.
+    std::optional<std::vector<unsigned char>> m_swiftsync_pending;
 public:
     explicit CCoinsViewDB(DBParams db_params, CoinsViewOptions options);
     ~CCoinsViewDB() override;
@@ -57,6 +59,10 @@ public:
     std::vector<uint256> GetHeadBlocks() const override;
     bool BatchWrite(CoinsViewCacheCursor& cursor, const uint256 &hashBlock) override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override;
+
+    //! SwiftSync: stage the state written atomically with the next flush, and read it back.
+    void SetSwiftSyncState(std::vector<unsigned char> state) { m_swiftsync_pending = std::move(state); }
+    std::optional<std::vector<unsigned char>> GetSwiftSyncState() const;
 
     //! Whether an unsupported database format is used.
     bool NeedsUpgrade();

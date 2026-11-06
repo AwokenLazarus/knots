@@ -56,6 +56,7 @@
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/syserror.h>
+#include <swiftsync.h>
 #include <validation.h>
 
 #ifdef ENABLE_WALLET
@@ -4422,6 +4423,68 @@ static RPCHelpMan getblocklocations()
 }
 
 
+static RPCHelpMan generateswiftsynchints()
+{
+    return RPCHelpMan{"generateswiftsynchints",
+        "Write a SwiftSync hints file for the current tip: which outputs of every block are still unspent.\n"
+        "Other nodes can then sync from genesis with -swiftsync=<file>. It reads the whole UTXO set and every\n"
+        "block, so it takes a long time on mainnet; use a large -rpcclienttimeout.\n",
+        {
+            {"path", RPCArg::Type::STR, RPCArg::Optional::NO, "Where to write the file (relative paths are to the network data directory)."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::STR, "path", "the file written"},
+            {RPCResult::Type::NUM, "height", "the terminal height"},
+            {RPCResult::Type::STR_HEX, "hash", "the block hash at the terminal height"},
+        }},
+        RPCExamples{HelpExampleCli("-rpcclienttimeout=0 generateswiftsynchints", "\"swiftsync.hints\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            ChainstateManager& chainman = EnsureChainman(node);
+            const ArgsManager& args{EnsureAnyArgsman(request.context)};
+            const fs::path path{fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(request.params[0].get_str()))};
+            int height{0};
+            uint256 hash;
+            Chainstate& chainstate{WITH_LOCK(cs_main, return chainman.ActiveChainstate())};
+            if (auto err{swiftsync::WriteHints(chainstate, path, height, hash)}) {
+                throw JSONRPCError(RPC_MISC_ERROR, *err);
+            }
+            UniValue ret(UniValue::VOBJ);
+            ret.pushKV("path", fs::PathToString(path));
+            ret.pushKV("height", height);
+            ret.pushKV("hash", hash.GetHex());
+            return ret;
+        },
+    };
+}
+
+static RPCHelpMan getswiftsyncinfo()
+{
+    return RPCHelpMan{"getswiftsyncinfo",
+        "Progress of a SwiftSync first sync (-swiftsync).\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::BOOL, "active", "whether blocks are being connected the SwiftSync way"},
+            {RPCResult::Type::NUM, "terminal_height", /*optional=*/true, "where SwiftSync ends and its check happens"},
+            {RPCResult::Type::NUM, "undo_stored", /*optional=*/true, "blocks whose undo data has arrived and waits on disk"},
+            {RPCResult::Type::NUM, "undo_failures", /*optional=*/true, "blocks whose served undo data failed and was fetched again"},
+        }},
+        RPCExamples{HelpExampleCli("getswiftsyncinfo", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            LOCK(cs_main);
+            UniValue ret(UniValue::VOBJ);
+            auto* const sw{swiftsync::g_swiftsync.get()};
+            ret.pushKV("active", sw && !sw->Done());
+            if (sw) {
+                ret.pushKV("terminal_height", sw->GetHints().Height());
+                ret.pushKV("undo_stored", uint64_t(sw->Undo().Count()));
+                ret.pushKV("undo_failures", uint64_t(sw->m_undo_failures.size()));
+            }
+            return ret;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -4435,6 +4498,8 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
         {"blockchain", &getchaintips},
+        {"blockchain", &generateswiftsynchints},
+        {"blockchain", &getswiftsyncinfo},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},

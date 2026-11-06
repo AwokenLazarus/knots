@@ -51,6 +51,7 @@
 #include <txdb.h>
 #include <txmempool.h>
 #include <uint256.h>
+#include <swiftsync.h>
 #include <undo.h>
 #include <util/check.h>
 #include <util/fs.h>
@@ -3309,6 +3310,9 @@ bool Chainstate::FlushStateToDisk(
             }
             // Flush the chainstate (which may refer to block index entries).
             const auto empty_cache{(mode == FlushStateMode::ALWAYS) || fCacheLarge || fCacheCritical};
+            if (auto* sw{swiftsync::g_swiftsync.get()}; sw && this == &m_chainman.ActiveChainstate()) {
+                CoinsDB().SetSwiftSyncState(sw->Serialize());
+            }
             if (empty_cache ? !CoinsTip().Flush() : !CoinsTip().Sync()) {
                 return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
             }
@@ -3617,6 +3621,75 @@ public:
  *
  * The block is added to connectTrace if connection succeeds.
  */
+bool Chainstate::SwiftSyncReady(const CBlockIndex& pindex)
+{
+    AssertLockHeld(cs_main);
+    auto* const sw{swiftsync::g_swiftsync.get()};
+    if (!sw || this != &m_chainman.ActiveChainstate() || !sw->Covers(pindex.nHeight)) return true;
+    // Only on the chain the hints were made for, which needs headers up to the terminal height.
+    const CBlockIndex* best{m_chainman.m_best_header};
+    const int terminal{sw->GetHints().Height()};
+    if (!best || best->nHeight < terminal) return false;
+    const CBlockIndex* end{best->GetAncestor(terminal)};
+    if (!end || end->GetBlockHash() != sw->GetHints().TerminalHash()) return false;
+    if (end->GetAncestor(pindex.nHeight) != &pindex) return false;
+    return sw->Undo().Have(pindex.GetBlockHash());
+}
+
+bool Chainstate::SwiftSyncApply(const CBlock& block, const CBlockIndex& pindex, const CBlockUndo& undo, BlockValidationState& state)
+{
+    AssertLockHeld(cs_main);
+    auto& sw{*Assert(swiftsync::g_swiftsync)};
+    auto& agg{sw.Agg()};
+    CCoinsViewCache& tip{CoinsTip()};
+    const int height{pindex.nHeight};
+    const std::vector<uint32_t> unspent{sw.GetHints().Unspent(height)};
+    // The two coinbases later overwritten by duplicates (BIP30) never become spendable coins.
+    const bool overwritten{IsBIP30Unspendable(pindex)};
+    size_t next{0};
+    uint32_t index{0};
+    for (size_t i = 0; i < block.vtx.size(); ++i) {
+        const CTransaction& tx{*block.vtx[i]};
+        const bool coinbase{tx.IsCoinBase()};
+        for (uint32_t o = 0; o < tx.vout.size(); ++o, ++index) {
+            const bool keep{next < unspent.size() && unspent[next] == index};
+            if (keep) ++next;
+            const CTxOut& out{tx.vout[o]};
+            if (out.scriptPubKey.IsUnspendable() || (coinbase && overwritten)) {
+                if (keep) return FatalError(m_chainman.GetNotifications(), state, _("SwiftSync hints mark an unspendable output as unspent; the hints file is wrong. Restart without -swiftsync."));
+                continue;
+            }
+            const COutPoint op{tx.GetHash(), o};
+            Coin coin{out, height, coinbase};
+            if (keep) {
+                tip.AddCoin(op, std::move(coin), /*possible_overwrite=*/coinbase);
+            } else {
+                agg.Add(op, coin);
+            }
+        }
+        if (coinbase) continue;
+        const CTxUndo& txundo{undo.vtxundo[i - 1]};
+        for (size_t j = 0; j < tx.vin.size(); ++j) agg.Spend(tx.vin[j].prevout, txundo.vprevout[j]);
+    }
+    if (next != unspent.size()) {
+        return FatalError(m_chainman.GetNotifications(), state, _("SwiftSync hints name outputs a block doesn't have; the hints file is wrong. Restart without -swiftsync."));
+    }
+    tip.SetBestBlock(pindex.GetBlockHash());
+    sw.Undo().Erase(pindex.GetBlockHash());
+    sw.m_undo_failures.erase(pindex.GetBlockHash());
+
+    if (height == sw.GetHints().Height()) {
+        if (agg.sum != 0) {
+            return FatalError(m_chainman.GetNotifications(), state,
+                _("SwiftSync failed at its terminal height: the hints or the undo data peers served were wrong, so the chain state can't be trusted. Restart with -reindex-chainstate and without -swiftsync."));
+        }
+        LogInfo("SwiftSync complete at height %d: every coin created below it was spent exactly once or is in the UTXO set\n", height);
+        sw.SetDone();
+        sw.Undo().Clear();
+    }
+    return true;
+}
+
 bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew, const std::shared_ptr<const CBlock>& pblock, ConnectTrace& connectTrace, DisconnectedBlockTransactions& disconnectpool)
 {
     AssertLockHeld(cs_main);
@@ -3645,16 +3718,52 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     LogDebug(BCLog::BENCH, "  - Load block from disk: %.2fms\n",
              Ticks<MillisecondsDouble>(time_2 - time_1));
     {
-        CCoinsViewCache view(&CoinsTip());
+        // SwiftSync: below the terminal height the coins this block spends come from its undo data
+        // (served by a peer), not from the UTXO set.
+        auto* const sw{this == &m_chainman.ActiveChainstate() ? swiftsync::g_swiftsync.get() : nullptr};
+        const bool swift{sw && sw->Covers(pindexNew->nHeight)};
+        CBlockUndo swift_undo;
+        std::optional<swiftsync::UndoCoinsView> swift_view;
+        if (swift) {
+            const uint256 hash{pindexNew->GetBlockHash()};
+            if (sw->Undo().Read(hash, swift_undo)) swift_view.emplace(&CoinsTip(), blockConnecting, swift_undo);
+            if (!swift_view || !swift_view->Matches()) {
+                LogWarning("SwiftSync: undo data for block %s is unreadable or doesn't match the block; fetching it again\n", hash.ToString());
+                sw->Undo().Erase(hash);
+                m_swiftsync_waiting = true;
+                return false;
+            }
+        }
+        CCoinsViewCache view(swift ? static_cast<CCoinsView*>(&*swift_view) : &CoinsTip());
         bool rv = ConnectBlock(blockConnecting, state, pindexNew, view);
-        if (m_chainman.m_options.signals) {
+        // A SwiftSync failure may be the served undo data's fault, not the block's: don't report it
+        // as a bad block (that would punish the peer that sent the block).
+        if (m_chainman.m_options.signals && (rv || !swift)) {
             m_chainman.m_options.signals->BlockChecked(blockConnecting, state);
+        }
+        if (!rv && swift && state.IsInvalid()) {
+            // The undo data came from a peer and may be wrong, so this doesn't show the block is
+            // invalid. Never mark it so; fetch the data again, and give up after a few tries.
+            const uint256 hash{pindexNew->GetBlockHash()};
+            const int failures{++sw->m_undo_failures[hash]};
+            LogWarning("SwiftSync: block %s failed with the served undo data (%s), attempt %d\n", hash.ToString(), state.ToString(), failures);
+            sw->Undo().Erase(hash);
+            if (failures >= 3) {
+                return FatalError(m_chainman.GetNotifications(), state,
+                    strprintf(_("SwiftSync could not validate block %s with the undo data its peers served. Restart without -swiftsync."), hash.ToString()));
+            }
+            state = BlockValidationState();
+            m_swiftsync_waiting = true;
+            return false;
         }
         if (!rv) {
             if (state.IsInvalid())
                 InvalidBlockFound(pindexNew, state);
             LogError("%s: ConnectBlock %s failed, %s\n", __func__, pindexNew->GetBlockHash().ToString(), state.ToString());
             return false;
+        }
+        if (swift) {
+            if (!SwiftSyncApply(blockConnecting, *pindexNew, swift_undo, state)) return false;
         }
         time_3 = SteadyClock::now();
         m_chainman.time_connect_total += time_3 - time_2;
@@ -3663,8 +3772,10 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
                  Ticks<MillisecondsDouble>(time_3 - time_2),
                  Ticks<SecondsDouble>(m_chainman.time_connect_total),
                  Ticks<MillisecondsDouble>(m_chainman.time_connect_total) / m_chainman.num_blocks_total);
-        bool flushed = view.Flush();
-        assert(flushed);
+        if (!swift) {
+            bool flushed = view.Flush();
+            assert(flushed);
+        }
     }
     const auto time_4{SteadyClock::now()};
     m_chainman.time_flush += time_4 - time_3;
@@ -3852,7 +3963,18 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
 
         // Connect new blocks.
         for (CBlockIndex* pindexConnect : vpindexToConnect | std::views::reverse) {
+            if (!SwiftSyncReady(*pindexConnect)) {
+                // Wait for this block's undo data; net_processing resumes activation when it arrives.
+                m_swiftsync_waiting = true;
+                fContinue = false;
+                break;
+            }
             if (!ConnectTip(state, pindexConnect, pindexConnect == pindexMostWork ? pblock : std::shared_ptr<const CBlock>(), connectTrace, disconnectpool)) {
+                if (m_swiftsync_waiting && !state.IsInvalid() && !state.IsError()) {
+                    // SwiftSync undo data was bad and has been dropped: stop here and wait for a new copy.
+                    fContinue = false;
+                    break;
+                }
                 if (state.IsInvalid()) {
                     // The block violates a consensus rule.
                     if (state.GetResult() != BlockValidationResult::BLOCK_MUTATED) {
@@ -3953,6 +4075,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         return false;
     }
 
+    bool swiftsync_wait{false}; // SwiftSync: stopped to wait for undo data
     CBlockIndex *pindexMostWork = nullptr;
     CBlockIndex *pindexNewTip = nullptr;
     bool exited_ibd{false};
@@ -3998,6 +4121,10 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                     return false;
                 }
                 blocks_connected = true;
+                if (m_swiftsync_waiting) {
+                    m_swiftsync_waiting = false;
+                    swiftsync_wait = true;
+                }
 
                 if (fInvalidFound) {
                     // Wipe cache, we may need another branch now.
@@ -4087,7 +4214,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // caused an assert() failure during interrupt in such cases as the UTXO DB flushing checks
         // that the best block hash is non-null.
         if (m_chainman.m_interrupt) break;
-    } while (pindexNewTip != pindexMostWork);
+    } while (pindexNewTip != pindexMostWork && !swiftsync_wait);
 
     m_chainman.CheckBlockIndex();
 
@@ -5375,6 +5502,14 @@ VerifyDBResult CVerifyDB::VerifyDB(
         nCheckDepth = chainstate.m_chain.Height();
     }
     nCheckLevel = std::max(0, std::min(4, nCheckLevel));
+    // Mid-SwiftSync the UTXO set holds only coins unspent at the terminal height, so blocks can't be
+    // disconnected against it (levels 3 and 4). The aggregate check at the terminal height covers them.
+    if (nCheckLevel > 2) {
+        if (auto saved{WITH_LOCK(cs_main, return chainstate.CoinsDB().GetSwiftSyncState())}; saved && swiftsync::StateActive(*saved)) {
+            LogInfo("SwiftSync in progress: verifying blocks at level 2, not %d\n", nCheckLevel);
+            nCheckLevel = 2;
+        }
+    }
     LogPrintf("Verifying last %i blocks at level %i\n", nCheckDepth, nCheckLevel);
     CCoinsViewCache coins(&coinsview);
     CBlockIndex* pindex;

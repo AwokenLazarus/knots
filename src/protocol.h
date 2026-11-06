@@ -264,6 +264,13 @@ inline constexpr const char* WTXIDRELAY{"wtxidrelay"};
  * txreconciliation, as described by BIP 330.
  */
 inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
+/**
+ * SwiftSync (Eddy): asks a peer for one block's undo data, the coins its inputs spend, by block
+ * hash. A peer that has it answers with swundo; others ignore it.
+ */
+inline constexpr const char* GETSWUNDO{"getswundo"};
+/** SwiftSync (Eddy): a block hash followed by that block's undo data (CBlockUndo). */
+inline constexpr const char* SWUNDO{"swundo"};
 }; // namespace NetMsgType
 
 /** All known message types (see above). Keep this in the same order as the list of messages above. */
@@ -303,6 +310,8 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::CFCHECKPT,
     NetMsgType::WTXIDRELAY,
     NetMsgType::SENDTXRCNCL,
+    NetMsgType::GETSWUNDO,
+    NetMsgType::SWUNDO,
 })};
 
 /** nServices flags */

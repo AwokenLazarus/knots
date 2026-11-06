@@ -97,6 +97,7 @@
 #include <util/threadnames.h>
 #include <util/time.h>
 #include <util/translation.h>
+#include <swiftsync.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <walletinitinterface.h>
@@ -491,6 +492,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 #if HAVE_SYSTEM
     argsman.AddArg("-alertnotify=<cmd>", "Execute command when an alert is raised (%s in cmd is replaced by message)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
+    argsman.AddArg("-swiftsync=<file>", "Sync faster from the genesis block with a SwiftSync hints file (made by the generateswiftsynchints RPC). Every block and signature is still checked; manually added peers that serve undo data (swundo) are required. Relative paths are to the network data directory.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-assumevalid=<hex>", strprintf("If this block is in the chain assume that it and its ancestors are valid and potentially skip their script verification (0 to verify all, default: %s, testnet3: %s, testnet4: %s, signet: %s)", defaultChainParams->GetConsensus().defaultAssumeValid.GetHex(), testnetChainParams->GetConsensus().defaultAssumeValid.GetHex(), testnet4ChainParams->GetConsensus().defaultAssumeValid.GetHex(), signetChainParams->GetConsensus().defaultAssumeValid.GetHex()), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksdir=<dir>", "Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksxor",
@@ -2109,6 +2111,34 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     ChainstateManager& chainman = *Assert(node.chainman);
     auto& kernel_notifications{*Assert(node.notifications)};
+
+    if (args.IsArgSet("-swiftsync")) {
+        const fs::path hints_path{fsbridge::AbsPathJoin(args.GetDataDirNet(), args.GetPathArg("-swiftsync"))};
+        swiftsync::Hints hints;
+        if (auto err{hints.Load(hints_path)}) return InitError(Untranslated(strprintf("SwiftSync: %s", *err)));
+        auto sw{std::make_unique<swiftsync::SwiftSync>(std::move(hints), args.GetDataDirNet() / "swiftsync" / "undo")};
+        LOCK(cs_main);
+        Chainstate& active{chainman.ActiveChainstate()};
+        const int tip_height{active.m_chain.Height()};
+        if (auto saved{active.CoinsDB().GetSwiftSyncState()}) {
+            if (!sw->Deserialize(*saved)) {
+                return InitError(Untranslated("SwiftSync: this chain state was synced with a different hints file. Use that file, or restart with -reindex-chainstate."));
+            }
+        } else if (tip_height <= 0) {
+            sw->NewSalt();
+        } else if (tip_height < sw->GetHints().Height()) {
+            return InitError(Untranslated("SwiftSync must start from the genesis block. Restart with -reindex-chainstate to use it."));
+        } else {
+            sw->SetDone();
+        }
+        if (sw->Done()) {
+            LogInfo("SwiftSync: already complete, ignoring -swiftsync\n");
+        } else {
+            LogInfo("SwiftSync: hints to height %d (%s), %u blocks' undo data on disk\n",
+                    sw->GetHints().Height(), sw->GetHints().TerminalHash().ToString(), sw->Undo().Count());
+            swiftsync::g_swiftsync = std::move(sw);
+        }
+    }
 
     assert(!node.peerman);
     node.peerman = PeerManager::make(*node.connman, *node.addrman,

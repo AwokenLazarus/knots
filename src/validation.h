@@ -558,6 +558,15 @@ protected:
     //! is set to true on the snapshot chainstate.
     bool m_disabled GUARDED_BY(::cs_main) {false};
 
+    //! SwiftSync: activation stopped because the next block's undo data hasn't arrived yet.
+    bool m_swiftsync_waiting GUARDED_BY(::cs_main) {false};
+
+    //! SwiftSync: whether the block can be connected now (undo data present, hints on our chain).
+    bool SwiftSyncReady(const CBlockIndex& pindex) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    //! SwiftSync: fold a connected block into the UTXO set and aggregate per the hints.
+    bool SwiftSyncApply(const CBlock& block, const CBlockIndex& pindex, const CBlockUndo& undo, BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     //! Cached result of LookupBlockIndex(*m_from_snapshot_blockhash)
     const CBlockIndex* m_cached_snapshot_base GUARDED_BY(::cs_main) {nullptr};
 
