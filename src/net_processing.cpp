@@ -1436,7 +1436,7 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
     // downloaded blocks, not the tip, so downloads would run ahead without limit. Blocks above the
     // tip can't be pruned, so on a phone that filled the disk. Keep them within a window of the tip.
     if (auto* const sw{swiftsync::g_swiftsync.get()}; sw && !sw->Done()) {
-        nWindowEnd = std::min(nWindowEnd, m_chainman.ActiveChain().Height() + BLOCK_DOWNLOAD_WINDOW);
+        nWindowEnd = std::min(nWindowEnd, m_chainman.ActiveChain().Height() + int(BLOCK_DOWNLOAD_WINDOW));
     }
 
     FindNextBlocks(vBlocks, peer, state, pindexWalk, count, nWindowEnd, &m_chainman.ActiveChain(), &nodeStaller);
