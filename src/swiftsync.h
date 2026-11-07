@@ -35,6 +35,7 @@
 #include <util/fs.h>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -101,10 +102,15 @@ public:
     /** The source of stored undo data, or nullopt. */
     std::optional<int64_t> Source(const uint256& block_hash) const;
     void Erase(const uint256& block_hash);
+    /** Drop every entry [stale] says is no longer needed; returns how many. */
+    size_t EraseIf(const std::function<bool(const uint256&)>& stale);
     void Clear();
     size_t Count() const;
     size_t Bytes() const { return m_bytes; }
     bool Full() const { return m_bytes >= MAX_BYTES; }
+    /** Blocks just above the tip that are asked for even when the store is full, so one lost
+     *  reply can't leave the store full of later blocks while the next one never comes. */
+    static constexpr int RESERVE{8};
 
 private:
     struct Entry {

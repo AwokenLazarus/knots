@@ -95,6 +95,8 @@ class SwiftSyncTest(BitcoinTestFramework):
         # Headers and blocks from node0, but not as a manual peer, so no swundo comes over P2P.
         self.connect_nodes(0, 2)  # inbound to node2: not a manual connection on its side
         export = node0.chain_path / "undo-export"
+        submitted = []
+        late = []
         def feed():
             for want in node2.getswiftsyncwants(512):
                 f = export / want["hash"][:2] / want["hash"]
@@ -102,8 +104,20 @@ class SwiftSyncTest(BitcoinTestFramework):
                 # for it once the block itself arrives. File hosting answers 404 here.
                 if f.exists():
                     node2.submitswiftsyncundo(want["hash"], f.read_bytes().hex())
+                    submitted.append(want["hash"])
+            # A late copy of a block that already connected is refused, not kept: kept copies
+            # once filled the memory budget and stopped all further requests.
+            info = node2.getswiftsyncinfo()
+            if not late and info["active"]:
+                for h in submitted:
+                    if node2.getblockheader(h)["confirmations"] > 0:
+                        f = export / h[:2] / h
+                        assert_equal(node2.submitswiftsyncundo(h, f.read_bytes().hex()), False)
+                        late.append(h)
+                        break
             return node2.getblockcount() >= node0.getblockcount()
         self.wait_until(feed, timeout=120)
+        assert late, "no block connected mid-SwiftSync to test a late copy with"
         assert "SwiftSync complete" in node2.debug_log_path.read_text()
         assert_equal(node2.getbestblockhash(), node0.getbestblockhash())
         self.stop_node(2)

@@ -3694,6 +3694,15 @@ bool Chainstate::SwiftSyncApply(const CBlock& block, const CBlockIndex& pindex, 
     tip.SetBestBlock(pindex.GetBlockHash());
     sw.Undo().Erase(pindex.GetBlockHash());
     sw.m_undo_failures.erase(pindex.GetBlockHash());
+    if (sw.Undo().Full()) {
+        // Copies that arrived after their block connected (from a second source, or late) are
+        // never used; drop them so they can't fill the store and stop new requests.
+        const size_t dropped{sw.Undo().EraseIf([&](const uint256& hash) {
+            const CBlockIndex* p{m_blockman.LookupBlockIndex(hash)};
+            return !p || p->nHeight <= height;
+        })};
+        if (dropped) LogInfo("SwiftSync: dropped %u unused undo entries\n", dropped);
+    }
 
     if (height == sw.GetHints().Height()) {
         if (agg.sum != 0) {

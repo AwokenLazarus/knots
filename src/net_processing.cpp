@@ -1663,7 +1663,7 @@ void PeerManagerImpl::MaybeRequestSwiftSyncUndo(CNode& node)
     for (int h = tip->nHeight + 1; h <= last && open < limit; ++h) {
         const CBlockIndex* pindex{best->GetAncestor(h)};
         if (!pindex) break;
-        if (sw->Undo().Full()) break; // memory budget for waiting undo data
+        if (h > tip->nHeight + swiftsync::UndoStore::RESERVE && sw->Undo().Full()) break; // memory budget for waiting undo data
         if (pindex->nTx == 1) continue; // coinbase-only block: nothing spent, nothing to fetch
         const uint256 hash{pindex->GetBlockHash()};
         if (sw->Undo().Have(hash) || m_swiftsync_inflight.contains(hash)) continue;
@@ -4334,7 +4334,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 m_swiftsync_batch.insert(pfrom.GetId());
                 m_swiftsync_unanswered.erase(pfrom.GetId());
                 const CBlockIndex* pindex{m_chainman.m_blockman.LookupBlockIndex(hash)};
-                if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash)) continue;
+                if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash) || m_chainman.ActiveChain().Contains(pindex)) continue;
                 sw->Undo().Write(hash, undo, pfrom.GetId());
                 if (tip && pindex->pprev == tip && (pindex->nStatus & BLOCK_HAVE_DATA)) resume = true;
             }
@@ -4385,7 +4385,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             m_swiftsync_servers.insert(pfrom.GetId());
             m_swiftsync_unanswered.erase(pfrom.GetId());
             const CBlockIndex* pindex{m_chainman.m_blockman.LookupBlockIndex(hash)};
-            if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash)) return;
+            if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash) || m_chainman.ActiveChain().Contains(pindex)) return;
             if (!sw->Undo().Write(hash, undo, pfrom.GetId())) {
                 LogWarning("SwiftSync: cannot store undo data for %s\n", hash.ToString());
                 return;

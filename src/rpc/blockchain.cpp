@@ -4556,8 +4556,8 @@ static RPCHelpMan getswiftsyncwants()
     return RPCHelpMan{"getswiftsyncwants",
         "SwiftSync: the next blocks above the tip (on the best header chain) whose undo data hasn't arrived yet,\n"
         "for a helper that fetches it from file hosting and hands it over with submitswiftsyncundo.\n"
-        "Blocks known to be coinbase-only are left out (they need none). Empty when SwiftSync isn't running\n"
-        "or the memory budget for waiting undo data is full.\n",
+        "Blocks known to be coinbase-only are left out (they need none). Empty when SwiftSync isn't running;\n"
+        "when the memory budget for waiting undo data is full, only the next few blocks are listed.\n",
         {
             {"count", RPCArg::Type::NUM, RPCArg::Default{256}, "How many blocks ahead to look (at most 2048)."},
         },
@@ -4574,11 +4574,12 @@ static RPCHelpMan getswiftsyncwants()
             auto* const sw{swiftsync::g_swiftsync.get()};
             const CBlockIndex* tip{chainman.ActiveChain().Tip()};
             const CBlockIndex* best{chainman.m_best_header};
-            if (!sw || sw->Done() || !tip || !best || sw->Undo().Full()) return ret;
+            if (!sw || sw->Done() || !tip || !best) return ret;
             const int last{std::min({sw->GetHints().Height(), best->nHeight, tip->nHeight + count})};
             for (int h = tip->nHeight + 1; h <= last; ++h) {
                 const CBlockIndex* pindex{best->GetAncestor(h)};
                 if (!pindex) break;
+                if (h > tip->nHeight + swiftsync::UndoStore::RESERVE && sw->Undo().Full()) break; // memory budget
                 if (pindex->nTx == 1 || sw->Undo().Have(pindex->GetBlockHash())) continue;
                 if (sw->m_bad_rpc_blocks.contains(pindex->GetBlockHash())) continue; // peers supply it
                 UniValue o(UniValue::VOBJ);
@@ -4596,7 +4597,7 @@ static RPCHelpMan submitswiftsyncundo()
     return RPCHelpMan{"submitswiftsyncundo",
         "SwiftSync: hand over one block's undo data (as served by file hosting: a serialized CBlockUndo).\n"
         "It is checked like data from a peer: against the block when it connects, and by the aggregate at the\n"
-        "terminal height. Returns false if the block isn't one SwiftSync needs.\n",
+        "terminal height. Returns false if the block isn't one SwiftSync needs (including one already connected).\n",
         {
             {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block's hash."},
             {"undo", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The serialized undo data, hex encoded."},
@@ -4619,6 +4620,7 @@ static RPCHelpMan submitswiftsyncundo()
                 auto* const sw{swiftsync::g_swiftsync.get()};
                 const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(hash)};
                 if (!sw || sw->Done() || !pindex || !sw->Covers(pindex->nHeight)) return false;
+                if (chainman.ActiveChain().Contains(pindex)) return false; // already connected: not needed
                 if (sw->m_bad_rpc_blocks.contains(hash)) return false; // file hosting's copy failed before
                 if (!sw->Undo().Have(hash)) sw->Undo().Write(hash, undo, swiftsync::SOURCE_RPC);
                 const CBlockIndex* tip{chainman.ActiveChain().Tip()};

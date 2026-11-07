@@ -142,6 +142,21 @@ void UndoStore::Erase(const uint256& block_hash)
     m_undo.erase(it);
 }
 
+size_t UndoStore::EraseIf(const std::function<bool(const uint256&)>& stale)
+{
+    size_t n{0};
+    for (auto it{m_undo.begin()}; it != m_undo.end();) {
+        if (stale(it->first)) {
+            m_bytes -= it->second.bytes;
+            it = m_undo.erase(it);
+            ++n;
+        } else {
+            ++it;
+        }
+    }
+    return n;
+}
+
 void UndoStore::Clear()
 {
     m_undo.clear();
