@@ -4469,7 +4469,8 @@ static RPCHelpMan getswiftsyncinfo()
             {RPCResult::Type::NUM, "terminal_height", /*optional=*/true, "where SwiftSync ends and its check happens"},
             {RPCResult::Type::STR_HEX, "terminal_hash", /*optional=*/true, "the block hash at the terminal height (names the hints and undo files on file hosting)"},
             {RPCResult::Type::NUM, "undo_bytes", /*optional=*/true, "bytes of undo data waiting in memory"},
-            {RPCResult::Type::NUM, "undo_stored", /*optional=*/true, "blocks whose undo data has arrived and waits on disk"},
+            {RPCResult::Type::NUM, "undo_stored", /*optional=*/true, "blocks whose undo data has arrived and waits (in memory or in packs)"},
+            {RPCResult::Type::NUM, "undo_packed", /*optional=*/true, "of those, blocks whose undo data waits in pack files on disk"},
             {RPCResult::Type::NUM, "undo_failures", /*optional=*/true, "blocks whose served undo data failed and was fetched again"},
             {RPCResult::Type::STR, "error", /*optional=*/true, "why SwiftSync can't go on, if it can't (fall back to an ordinary sync)"},
         }},
@@ -4484,6 +4485,7 @@ static RPCHelpMan getswiftsyncinfo()
                 ret.pushKV("terminal_hash", sw->GetHints().TerminalHash().GetHex());
                 ret.pushKV("undo_bytes", uint64_t(sw->Undo().Bytes()));
                 ret.pushKV("undo_stored", uint64_t(sw->Undo().Count()));
+                ret.pushKV("undo_packed", uint64_t(sw->Undo().PackedCount()));
                 ret.pushKV("undo_failures", uint64_t(sw->m_undo_failures.size()));
                 if (!sw->m_error.empty()) ret.pushKV("error", sw->m_error);
             }
@@ -4581,7 +4583,7 @@ static RPCHelpMan getswiftsyncwants()
                 if (!pindex) break;
                 if (h > tip->nHeight + swiftsync::UndoStore::RESERVE && sw->Undo().Full()) break; // memory budget
                 if (pindex->nTx == 1 || sw->Undo().Have(pindex->GetBlockHash())) continue;
-                if (sw->m_bad_rpc_blocks.contains(pindex->GetBlockHash())) continue; // peers supply it
+                if (sw->RpcBlamed(pindex->GetBlockHash())) continue; // peers supply it for a while
                 UniValue o(UniValue::VOBJ);
                 o.pushKV("height", h);
                 o.pushKV("hash", pindex->GetBlockHash().GetHex());
@@ -4621,7 +4623,7 @@ static RPCHelpMan submitswiftsyncundo()
                 const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(hash)};
                 if (!sw || sw->Done() || !pindex || !sw->Covers(pindex->nHeight)) return false;
                 if (chainman.ActiveChain().Contains(pindex)) return false; // already connected: not needed
-                if (sw->m_bad_rpc_blocks.contains(hash)) return false; // file hosting's copy failed before
+                if (sw->RpcBlamed(hash)) return false; // file hosting's copy failed just now
                 if (!sw->Undo().Have(hash)) sw->Undo().Write(hash, undo, swiftsync::SOURCE_RPC);
                 const CBlockIndex* tip{chainman.ActiveChain().Tip()};
                 resume = tip && pindex->pprev == tip && (pindex->nStatus & BLOCK_HAVE_DATA);
@@ -4631,6 +4633,63 @@ static RPCHelpMan submitswiftsyncundo()
                 chainman.ActiveChainstate().ActivateBestChain(state);
             }
             return true;
+        },
+    };
+}
+
+static RPCHelpMan loadswiftsyncundopack()
+{
+    return RPCHelpMan{"loadswiftsyncundopack",
+        "SwiftSync: index an undo pack file (many blocks' undo data, as file hosting serves it in bulk).\n"
+        "Its entries are read from the file when their blocks connect, so the file must stay in place until\n"
+        "the tip passes its last height. Entries for blocks SwiftSync doesn't need (connected, unknown or\n"
+        "past the terminal height) are skipped. Like all undo data, it is untrusted: each entry is checked\n"
+        "against its block when it connects, and by the aggregate at the terminal height.\n",
+        {
+            {"path", RPCArg::Type::STR, RPCArg::Optional::NO, "The pack file."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "first", "first height the pack covers"},
+            {RPCResult::Type::NUM, "last", "last height the pack covers"},
+            {RPCResult::Type::NUM, "entries", "entries in the pack"},
+            {RPCResult::Type::NUM, "indexed", "entries indexed for blocks SwiftSync still needs"},
+        }},
+        RPCExamples{HelpExampleCli("loadswiftsyncundopack", "\"/path/to/pack\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const fs::path path{fs::u8path(request.params[0].get_str())};
+            int first{0}, last{0};
+            // Scan without cs_main: it reads the whole entry table from disk.
+            auto entries{swiftsync::UndoStore::ScanPack(path, first, last)};
+            if (!entries) throw JSONRPCError(RPC_INVALID_PARAMETER, util::ErrorString(entries).original);
+            size_t indexed{0};
+            bool resume{false};
+            {
+                LOCK(cs_main);
+                auto* const sw{swiftsync::g_swiftsync.get()};
+                if (!sw || sw->Done()) throw JSONRPCError(RPC_MISC_ERROR, "SwiftSync is not running");
+                const CChain& active{chainman.ActiveChain()};
+                indexed = sw->Undo().IndexPack(path, *entries, [&](const uint256& hash) {
+                    const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(hash)};
+                    return pindex && sw->Covers(pindex->nHeight) && !active.Contains(pindex) && !sw->RpcBlamed(hash);
+                });
+                const CBlockIndex* tip{active.Tip()};
+                const CBlockIndex* best{chainman.m_best_header};
+                if (tip && best && best->nHeight > tip->nHeight) {
+                    const CBlockIndex* next{best->GetAncestor(tip->nHeight + 1)};
+                    resume = next && next->pprev == tip && (next->nStatus & BLOCK_HAVE_DATA) && sw->Undo().Have(next->GetBlockHash());
+                }
+            }
+            if (resume) {
+                BlockValidationState state;
+                chainman.ActiveChainstate().ActivateBestChain(state);
+            }
+            UniValue ret(UniValue::VOBJ);
+            ret.pushKV("first", first);
+            ret.pushKV("last", last);
+            ret.pushKV("entries", uint64_t(entries->size()));
+            ret.pushKV("indexed", uint64_t(indexed));
+            return ret;
         },
     };
 }
@@ -4653,6 +4712,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &exportswiftsyncundo},
         {"blockchain", &getswiftsyncwants},
         {"blockchain", &submitswiftsyncundo},
+        {"blockchain", &loadswiftsyncundopack},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},

@@ -3761,7 +3761,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
                 const int64_t source{sw->Undo().Source(hash).value_or(swiftsync::SOURCE_RPC)};
                 LogWarning("SwiftSync: undo data for block %s from %s doesn't match the block, attempt %d\n", hash.ToString(),
                            source == swiftsync::SOURCE_RPC ? "file hosting" : strprintf("peer=%d", source), failures);
-                if (source == swiftsync::SOURCE_RPC) sw->m_bad_rpc_blocks.insert(hash); else sw->m_bad_peers.insert(source);
+                if (source == swiftsync::SOURCE_RPC) sw->BlameRpc(hash); else sw->m_bad_peers.insert(source);
                 sw->Undo().Erase(hash);
                 if (failures >= 3) {
                     return FatalError(m_chainman.GetNotifications(), state,
@@ -3787,7 +3787,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
             LogWarning("SwiftSync: block %s failed with undo data from %s (%s), attempt %d\n", hash.ToString(),
                        source == swiftsync::SOURCE_RPC ? "file hosting" : strprintf("peer=%d", source), state.ToString(), failures);
             // Blame the source: a peer is no longer asked; data from file hosting is fetched from peers instead.
-            if (source == swiftsync::SOURCE_RPC) sw->m_bad_rpc_blocks.insert(hash); else sw->m_bad_peers.insert(source);
+            if (source == swiftsync::SOURCE_RPC) sw->BlameRpc(hash); else sw->m_bad_peers.insert(source);
             sw->Undo().Erase(hash);
             if (failures >= 3) {
                 return FatalError(m_chainman.GetNotifications(), state,

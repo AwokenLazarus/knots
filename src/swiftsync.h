@@ -33,6 +33,7 @@
 #include <uint256.h>
 #include <undo.h>
 #include <util/fs.h>
+#include <util/result.h>
 
 #include <cstdint>
 #include <functional>
@@ -87,7 +88,15 @@ struct Aggregate {
     arith_uint256 Hash(const COutPoint& outpoint, const Coin& coin) const;
 };
 
-/** Undo data received from peers ahead of the blocks being connected, held in memory. */
+/**
+ * Undo data waiting for its block: received from peers or RPC and held in memory, or indexed in
+ * undo pack files on disk (from file hosting) and read when the block connects.
+ *
+ * Pack file (all integers little endian): "XBTSWUP1", uint32 version (1), int32 first height,
+ * int32 last height, uint32 entry count; then per entry a 32-byte block hash, a uint32 length and
+ * that many bytes of serialized CBlockUndo. Entries are blocks between first and last height that
+ * spend something, in height order.
+ */
 /** Where a block's undo data came from: a peer's id, or RPC (an app fetching from file hosting). */
 static constexpr int64_t SOURCE_RPC{-1};
 
@@ -101,6 +110,18 @@ public:
     bool Write(const uint256& block_hash, const CBlockUndo& undo, int64_t source = SOURCE_RPC);
     /** The source of stored undo data, or nullopt. */
     std::optional<int64_t> Source(const uint256& block_hash) const;
+    /** Index the entries of a pack file that [wanted] accepts. Returns how many, or an error. */
+    util::Result<size_t> AddPack(const fs::path& path, const std::function<bool(const uint256&)>& wanted);
+    /** Read a pack file's entries (hash, offset, length) without touching the store. */
+    struct PackEntry {
+        uint256 hash;
+        uint64_t offset;
+        uint32_t len;
+    };
+    static util::Result<std::vector<PackEntry>> ScanPack(const fs::path& path, int& first, int& last);
+    /** Index already-scanned entries of [path] (see ScanPack). */
+    size_t IndexPack(const fs::path& path, const std::vector<PackEntry>& entries, const std::function<bool(const uint256&)>& wanted);
+    size_t PackedCount() const { return m_packed.size(); }
     void Erase(const uint256& block_hash);
     /** Drop every entry [stale] says is no longer needed; returns how many. */
     size_t EraseIf(const std::function<bool(const uint256&)>& stale);
@@ -120,6 +141,12 @@ private:
     };
     std::map<uint256, Entry> m_undo;
     size_t m_bytes{0};
+    struct PackRef {
+        std::shared_ptr<const fs::path> file;
+        uint64_t offset;
+        uint32_t len;
+    };
+    std::map<uint256, PackRef> m_packed;
 };
 
 /**
@@ -167,8 +194,12 @@ public:
     std::map<uint256, int> m_undo_failures;
     /** Peers whose undo data failed a block: no longer asked. */
     std::set<int64_t> m_bad_peers;
-    /** Blocks whose undo data from file hosting (RPC) failed: fetched from peers instead. */
-    std::set<uint256> m_bad_rpc_blocks;
+    /** Blocks whose undo data from file hosting (RPC) failed, and when: fetched from peers for a
+     *  while, then from file hosting again (there may be no peer serving it). */
+    std::map<uint256, int64_t> m_bad_rpc_blocks;
+    static constexpr int64_t RPC_BLAME_SECONDS{60};
+    void BlameRpc(const uint256& hash);
+    bool RpcBlamed(const uint256& hash) const;
     /** Set when SwiftSync can't go on (e.g. the hints are for a block not on this chain); the app falls back. */
     std::string m_error;
 

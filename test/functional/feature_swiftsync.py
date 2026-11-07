@@ -11,10 +11,11 @@ same UTXO set as node0. node2 gets a hints file with one hint flipped and must s
 instead of accepting the chain.
 """
 import shutil
+import struct
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import ErrorMatch
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
@@ -95,8 +96,16 @@ class SwiftSyncTest(BitcoinTestFramework):
         # Headers and blocks from node0, but not as a manual peer, so no swundo comes over P2P.
         self.connect_nodes(0, 2)  # inbound to node2: not a manual connection on its side
         export = node0.chain_path / "undo-export"
-        submitted = []
-        late = []
+        # A late copy of a block that already connected is refused, not kept: kept copies once
+        # filled the memory budget and stopped all further requests.
+        self.wait_until(lambda: any((export / w["hash"][:2] / w["hash"]).exists() for w in node2.getswiftsyncwants(512)), timeout=60)
+        first = next(w for w in node2.getswiftsyncwants(512) if (export / w["hash"][:2] / w["hash"]).exists())
+        first_data = (export / first["hash"][:2] / first["hash"]).read_bytes().hex()
+        assert node2.submitswiftsyncundo(first["hash"], first_data)
+        self.wait_until(lambda: node2.getblockcount() >= first["height"], timeout=60)
+        assert node2.getswiftsyncinfo()["active"]
+        assert_equal(node2.submitswiftsyncundo(first["hash"], first_data), False)
+        assert_equal(node2.getswiftsyncinfo()["undo_stored"], 0)
         def feed():
             for want in node2.getswiftsyncwants(512):
                 f = export / want["hash"][:2] / want["hash"]
@@ -104,22 +113,48 @@ class SwiftSyncTest(BitcoinTestFramework):
                 # for it once the block itself arrives. File hosting answers 404 here.
                 if f.exists():
                     node2.submitswiftsyncundo(want["hash"], f.read_bytes().hex())
-                    submitted.append(want["hash"])
-            # A late copy of a block that already connected is refused, not kept: kept copies
-            # once filled the memory budget and stopped all further requests.
-            info = node2.getswiftsyncinfo()
-            if not late and info["active"]:
-                for h in submitted:
-                    if node2.getblockheader(h)["confirmations"] > 0:
-                        f = export / h[:2] / h
-                        assert_equal(node2.submitswiftsyncundo(h, f.read_bytes().hex()), False)
-                        late.append(h)
-                        break
             return node2.getblockcount() >= node0.getblockcount()
         self.wait_until(feed, timeout=120)
-        assert late, "no block connected mid-SwiftSync to test a late copy with"
         assert "SwiftSync complete" in node2.debug_log_path.read_text()
         assert_equal(node2.getbestblockhash(), node0.getbestblockhash())
+        self.stop_node(2)
+        shutil.rmtree(node2.chain_path / "blocks")
+        shutil.rmtree(node2.chain_path / "chainstate")
+
+        self.log.info("undo data can also come in packs: many blocks per file, read from disk as blocks connect")
+        node2 = self.nodes[2]
+        shutil.copy(hints["path"], node2.chain_path / "pack.hints")
+        self.start_node(2, extra_args=["-swiftsync=pack.hints", "-noconnect"])
+        def write_pack(path, first, last):
+            entries = []
+            for h in range(first, last + 1):
+                bh = node0.getblockhash(h)
+                f = export / bh[:2] / bh
+                if f.exists():
+                    entries.append((bytes.fromhex(bh)[::-1], f.read_bytes()))
+            with open(path, "wb") as out:
+                out.write(b"XBTSWUP1" + struct.pack("<IiiI", 1, first, last, len(entries)))
+                for hash_le, data in entries:
+                    out.write(hash_le + struct.pack("<I", len(data)) + data)
+            return len(entries)
+        spenders = [h for h in range(1, hints["height"] + 1) if node0.getblock(node0.getblockhash(h))["nTx"] > 1]
+        mid = spenders[len(spenders) // 2]
+        n1 = write_pack(node2.chain_path / "p1", 1, mid)
+        n2 = write_pack(node2.chain_path / "p2", mid + 1, hints["height"])
+        assert_raises_rpc_error(-8, "not an undo pack", node2.loadswiftsyncundopack, str(node2.chain_path / "pack.hints"))
+        # Entries are indexed only for blocks whose headers are known; the app loads packs after headers sync.
+        self.connect_nodes(0, 2)  # blocks only: no swundo over P2P (inbound, not manual)
+        self.wait_until(lambda: node2.getblockchaininfo()["headers"] == node0.getblockcount(), timeout=60)
+        r1 = node2.loadswiftsyncundopack(str(node2.chain_path / "p1"))
+        assert_equal((r1["first"], r1["last"], r1["entries"], r1["indexed"]), (1, mid, n1, n1))
+        r2 = node2.loadswiftsyncundopack(str(node2.chain_path / "p2"))
+        assert_equal(r2["indexed"], n2)
+        assert_equal(node2.getswiftsyncinfo()["undo_packed"], n1 + n2)
+        # Nothing a pack holds is left to fetch one by one (blocks not yet received may still be listed).
+        assert not [w for w in node2.getswiftsyncwants(512) if (export / w["hash"][:2] / w["hash"]).exists()]
+        self.sync_blocks([node0, node2], timeout=120)
+        assert "SwiftSync complete" in node2.debug_log_path.read_text()
+        assert_equal(node2.gettxoutsetinfo("hash_serialized_3")["hash_serialized_3"], node0.gettxoutsetinfo("hash_serialized_3")["hash_serialized_3"])
         self.stop_node(2)
         shutil.rmtree(node2.chain_path / "blocks")
         shutil.rmtree(node2.chain_path / "chainstate")
