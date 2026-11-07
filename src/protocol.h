@@ -271,6 +271,10 @@ inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
 inline constexpr const char* GETSWUNDO{"getswundo"};
 /** SwiftSync (Eddy): a block hash followed by that block's undo data (CBlockUndo). */
 inline constexpr const char* SWUNDO{"swundo"};
+/** SwiftSync (Eddy): the undo data of up to 128 blocks, by hash, in one request. */
+inline constexpr const char* GETSWUNDOS{"getswundos"};
+/** SwiftSync (Eddy): undo data for several blocks: a vector of (block hash, CBlockUndo). */
+inline constexpr const char* SWUNDOS{"swundos"};
 }; // namespace NetMsgType
 
 /** All known message types (see above). Keep this in the same order as the list of messages above. */
@@ -312,6 +316,8 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::SENDTXRCNCL,
     NetMsgType::GETSWUNDO,
     NetMsgType::SWUNDO,
+    NetMsgType::GETSWUNDOS,
+    NetMsgType::SWUNDOS,
 })};
 
 /** nServices flags */

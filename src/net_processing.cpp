@@ -719,6 +719,8 @@ private:
     /** SwiftSync: peers that have answered (served undo), and how many requests each got unanswered. */
     std::set<NodeId> m_swiftsync_servers GUARDED_BY(cs_main);
     std::map<NodeId, int> m_swiftsync_unanswered GUARDED_BY(cs_main);
+    /** SwiftSync: peers that have answered a batched request (getswundos). */
+    std::set<NodeId> m_swiftsync_batch GUARDED_BY(cs_main);
 
     /** Relay (gossip) an address to a few randomly chosen nodes.
      *
@@ -1618,7 +1620,7 @@ void PeerManagerImpl::MaybeRequestSwiftSyncUndo(CNode& node)
     // open; one that hasn't yet gets a single probe, so blocks don't wait on peers that never
     // answer (stock nodes ignore getswundo).
     static constexpr int WINDOW{512};
-    static constexpr int PER_SERVER{128};
+    static constexpr int PER_SERVER{512};
     static constexpr std::chrono::seconds SERVER_TIMEOUT{60};
     static constexpr std::chrono::seconds PROBE_TIMEOUT{15};
     if (!node.IsManualConn()) return;
@@ -1646,20 +1648,37 @@ void PeerManagerImpl::MaybeRequestSwiftSyncUndo(CNode& node)
     }
     const int limit{server ? PER_SERVER : 1};
     const int last{std::min({sw->GetHints().Height(), best->nHeight, tip->nHeight + WINDOW})};
+    // Ask in batches: the requesting node handles one message per peer per pass of its message
+    // loop, so one reply per block capped a phone at a few blocks a second. Peers that haven't
+    // answered a batch yet are probed both ways; one that answers only singles keeps getting singles.
+    const bool batch{!server || m_swiftsync_batch.contains(id)};
+    std::vector<uint256> want;
     for (int h = tip->nHeight + 1; h <= last && open < limit; ++h) {
         const CBlockIndex* pindex{best->GetAncestor(h)};
         if (!pindex) break;
+        if (sw->Undo().Full()) break; // memory budget for waiting undo data
+        if (pindex->nTx == 1) continue; // coinbase-only block: nothing spent, nothing to fetch
         const uint256 hash{pindex->GetBlockHash()};
         if (sw->Undo().Have(hash) || m_swiftsync_inflight.contains(hash)) continue;
         m_swiftsync_inflight.emplace(hash, std::make_pair(id, now));
         ++open;
-        MakeAndPushMessage(node, NetMsgType::GETSWUNDO, hash);
+        want.push_back(hash);
+    }
+    if (want.empty()) return;
+    if (batch) {
+        for (size_t i = 0; i < want.size(); i += 64) {
+            MakeAndPushMessage(node, NetMsgType::GETSWUNDOS,
+                               std::vector<uint256>(want.begin() + i, want.begin() + std::min(want.size(), i + 64)));
+        }
+        if (!server) MakeAndPushMessage(node, NetMsgType::GETSWUNDO, want.front()); // single-message servers
+    } else {
+        for (const uint256& hash : want) MakeAndPushMessage(node, NetMsgType::GETSWUNDO, hash);
     }
 }
 
 void PeerManagerImpl::FinalizeNode(const CNode& node)
 {
-    WITH_LOCK(cs_main, m_swiftsync_servers.erase(node.GetId()); m_swiftsync_unanswered.erase(node.GetId()));
+    WITH_LOCK(cs_main, m_swiftsync_servers.erase(node.GetId()); m_swiftsync_unanswered.erase(node.GetId()); m_swiftsync_batch.erase(node.GetId()));
     NodeId nodeid = node.GetId();
     {
     LOCK(cs_main);
@@ -4253,6 +4272,75 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         return;
     }
 
+    if (msg_type == NetMsgType::GETSWUNDOS) {
+        // SwiftSync: serve several blocks' undo data in as few messages as fit (about 3 MB each).
+        static constexpr size_t MAX_HASHES{128};
+        static constexpr size_t MAX_REPLY_BYTES{3'000'000};
+        std::vector<uint256> hashes;
+        vRecv >> hashes;
+        if (hashes.size() > MAX_HASHES) {
+            Misbehaving(*peer, "getswundos message size too large");
+            return;
+        }
+        if (m_connman.OutboundTargetReached(/*historicalBlockServingLimit=*/true) &&
+            !pfrom.HasPermission(NetPermissionFlags::Download)) {
+            return;
+        }
+        std::vector<std::pair<uint256, CBlockUndo>> reply;
+        size_t reply_bytes{0};
+        for (const uint256& hash : hashes) {
+            const CBlockIndex* pindex{nullptr};
+            {
+                LOCK(cs_main);
+                pindex = m_chainman.m_blockman.LookupBlockIndex(hash);
+                if (!pindex || !(pindex->nStatus & BLOCK_HAVE_UNDO) || !m_chainman.ActiveChain().Contains(pindex)) continue;
+            }
+            CBlockUndo undo;
+            if (!m_chainman.m_blockman.ReadBlockUndo(undo, *pindex)) continue;
+            const size_t bytes{GetSerializeSize(undo) + 32};
+            if (!reply.empty() && reply_bytes + bytes > MAX_REPLY_BYTES) {
+                MakeAndPushMessage(pfrom, NetMsgType::SWUNDOS, reply);
+                reply.clear();
+                reply_bytes = 0;
+            }
+            reply.emplace_back(hash, std::move(undo));
+            reply_bytes += bytes;
+        }
+        if (!reply.empty()) MakeAndPushMessage(pfrom, NetMsgType::SWUNDOS, reply);
+        return;
+    }
+
+    if (msg_type == NetMsgType::SWUNDOS) {
+        std::vector<std::pair<uint256, CBlockUndo>> batch;
+        vRecv >> batch;
+        bool resume{false};
+        {
+            LOCK(cs_main);
+            auto* const sw{swiftsync::g_swiftsync.get()};
+            if (!sw || sw->Done()) return;
+            const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+            for (auto& [hash, undo] : batch) {
+                auto it{m_swiftsync_inflight.find(hash)};
+                if (it == m_swiftsync_inflight.end() || it->second.first != pfrom.GetId()) continue; // unasked
+                m_swiftsync_inflight.erase(it);
+                m_swiftsync_servers.insert(pfrom.GetId());
+                m_swiftsync_batch.insert(pfrom.GetId());
+                m_swiftsync_unanswered.erase(pfrom.GetId());
+                const CBlockIndex* pindex{m_chainman.m_blockman.LookupBlockIndex(hash)};
+                if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash)) continue;
+                sw->Undo().Write(hash, undo);
+                if (tip && pindex->pprev == tip && (pindex->nStatus & BLOCK_HAVE_DATA)) resume = true;
+            }
+        }
+        if (resume) {
+            BlockValidationState state;
+            if (!m_chainman.ActiveChainstate().ActivateBestChain(state)) {
+                LogDebug(BCLog::NET, "SwiftSync: activation after undo data failed: %s\n", state.ToString());
+            }
+        }
+        return;
+    }
+
     if (msg_type == NetMsgType::GETSWUNDO) {
         // SwiftSync: serve one block's undo data (the coins its inputs spend) from our active chain.
         uint256 hash;
@@ -6129,7 +6217,16 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         // Message: getdata (blocks)
         //
         std::vector<CInv> vGetData;
-        if (CanServeBlocks(*peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(*peer)) || !m_chainman.IsInitialBlockDownload()) && state.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+        // SwiftSync: a peer serving undo data isn't asked for blocks too. Its replies are small and
+        // each one gates a block, so they mustn't queue behind megabytes of block data on the same
+        // connection (on a phone that took a peer's ping from 0.1 s to 26 s). Other peers send blocks.
+        const bool swiftsync_server{[&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+            auto* const sw{swiftsync::g_swiftsync.get()};
+            // ...unless there is no other peer to download from.
+            return sw && !sw->Done() && m_swiftsync_servers.contains(pto->GetId()) &&
+                   m_num_preferred_download_peers > int(m_swiftsync_servers.size());
+        }()};
+        if (!swiftsync_server && CanServeBlocks(*peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(*peer)) || !m_chainman.IsInitialBlockDownload()) && state.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
             std::vector<const CBlockIndex*> vToDownload;
             NodeId staller = -1;
             auto get_inflight_budget = [&state]() {

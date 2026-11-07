@@ -64,8 +64,14 @@ std::vector<uint32_t> Hints::Unspent(int height) const
 {
     std::vector<uint32_t> out;
     if (height < 0 || height > m_height) return out;
-    AutoFile file{fsbridge::fopen(m_path, "rb")};
-    if (file.IsNull()) throw std::runtime_error("SwiftSync hints file disappeared");
+    if (!m_file) {
+        m_file = std::make_shared<AutoFile>(fsbridge::fopen(m_path, "rb"));
+        if (m_file->IsNull()) {
+            m_file.reset();
+            throw std::runtime_error("SwiftSync hints file disappeared");
+        }
+    }
+    AutoFile& file{*m_file};
     file.seek(m_offsets[height], SEEK_SET);
     const uint64_t count = ReadCompactSize(file, /*range_check=*/false);
     out.reserve(count);
@@ -88,68 +94,42 @@ arith_uint256 Aggregate::Hash(const COutPoint& outpoint, const Coin& coin) const
 
 // ---- undo store ----------------------------------------------------------------------------
 
-UndoStore::UndoStore(fs::path dir) : m_dir(std::move(dir))
-{
-    fs::create_directories(m_dir);
-    std::error_code ec;
-    for (const auto& e : fs::directory_iterator(m_dir, ec)) {
-        const std::string name{fs::PathToString(e.path().filename())};
-        if (name.size() != 64 + 5 || !name.ends_with(".undo")) continue;
-        if (auto hash{uint256::FromHex(name.substr(0, 64))}) m_have.insert(*hash);
-    }
-}
+// Undo data waiting to be connected is held in memory: a few hundred small blocks early in the
+// chain, a few dozen large ones later (requests stop at MAX_BYTES). Losing it on a crash costs only
+// a re-request, so it never touches the disk.
 
-fs::path UndoStore::File(const uint256& block_hash) const
-{
-    return m_dir / fs::u8path(block_hash.GetHex() + ".undo");
-}
-
-bool UndoStore::Have(const uint256& block_hash) const { return m_have.contains(block_hash); }
+bool UndoStore::Have(const uint256& block_hash) const { return m_undo.contains(block_hash); }
 
 bool UndoStore::Read(const uint256& block_hash, CBlockUndo& undo) const
 {
-    AutoFile file{fsbridge::fopen(File(block_hash), "rb")};
-    if (file.IsNull()) return false;
-    try {
-        file >> undo;
-    } catch (const std::exception&) {
-        return false;
-    }
+    auto it{m_undo.find(block_hash)};
+    if (it == m_undo.end()) return false;
+    undo = it->second.first;
     return true;
 }
 
 bool UndoStore::Write(const uint256& block_hash, const CBlockUndo& undo)
 {
-    const fs::path final_path{File(block_hash)};
-    fs::path tmp{final_path};
-    tmp += ".tmp";
-    {
-        AutoFile file{fsbridge::fopen(tmp, "wb")};
-        if (file.IsNull()) return false;
-        file << undo;
-        if (file.fclose() != 0) return false;
-    }
-    if (!RenameOver(tmp, final_path)) return false;
-    m_have.insert(block_hash);
+    const size_t bytes{GetSerializeSize(undo)};
+    if (m_undo.emplace(block_hash, std::make_pair(undo, bytes)).second) m_bytes += bytes;
     return true;
 }
 
 void UndoStore::Erase(const uint256& block_hash)
 {
-    std::error_code ec;
-    fs::remove(File(block_hash), ec);
-    m_have.erase(block_hash);
+    auto it{m_undo.find(block_hash)};
+    if (it == m_undo.end()) return;
+    m_bytes -= it->second.second;
+    m_undo.erase(it);
 }
 
 void UndoStore::Clear()
 {
-    std::error_code ec;
-    fs::remove_all(m_dir, ec);
-    fs::create_directories(m_dir);
-    m_have.clear();
+    m_undo.clear();
+    m_bytes = 0;
 }
 
-size_t UndoStore::Count() const { return m_have.size(); }
+size_t UndoStore::Count() const { return m_undo.size(); }
 
 // ---- coins view over a block's undo data ---------------------------------------------------
 

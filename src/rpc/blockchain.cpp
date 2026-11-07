@@ -50,6 +50,7 @@
 #include <txdb.h>
 #include <txmempool.h>
 #include <undo.h>
+#include <util/signalinterrupt.h>
 #include <univalue.h>
 #include <util/check.h>
 #include <util/fs.h>
@@ -4485,6 +4486,65 @@ static RPCHelpMan getswiftsyncinfo()
     };
 }
 
+static RPCHelpMan exportswiftsyncundo()
+{
+    return RPCHelpMan{"exportswiftsyncundo",
+        "Write the undo data (the coins each block spends) of every active-chain block from 1 to a height\n"
+        "as one file per block, named by block hash in two-hex-digit subfolders, for serving SwiftSync\n"
+        "from plain file hosting. Blocks whose only transaction is the coinbase are skipped (nothing spent).\n"
+        "Existing files are kept, so an interrupted export can be resumed. Takes hours on mainnet.\n",
+        {
+            {"dir", RPCArg::Type::STR, RPCArg::Optional::NO, "Output folder (relative paths are to the network data directory)."},
+            {"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Last height to export (normally the hints file's terminal height)."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "files", "files written"},
+            {RPCResult::Type::NUM, "skipped", "blocks skipped: coinbase-only or already exported"},
+            {RPCResult::Type::NUM, "bytes", "bytes written"},
+        }},
+        RPCExamples{HelpExampleCli("-rpcclienttimeout=0 exportswiftsyncundo", "\"swiftsync-undo\" 980830")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            ChainstateManager& chainman = EnsureChainman(node);
+            const ArgsManager& args{EnsureAnyArgsman(request.context)};
+            const fs::path dir{fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(request.params[0].get_str()))};
+            const int height{request.params[1].getInt<int>()};
+            const CBlockIndex* end{WITH_LOCK(cs_main, return chainman.ActiveChain()[height])};
+            if (!end) throw JSONRPCError(RPC_INVALID_PARAMETER, "height is above the tip");
+            uint64_t files{0}, skipped{0}, bytes{0};
+            for (int h = 1; h <= height; ++h) {
+                if (h % 1000 == 0 && static_cast<bool>(chainman.m_interrupt)) throw JSONRPCError(RPC_MISC_ERROR, "stopped: the node is shutting down");
+                const CBlockIndex* pindex{end->GetAncestor(h)};
+                if (pindex->nTx == 1) { ++skipped; continue; }
+                const std::string hex{pindex->GetBlockHash().GetHex()};
+                const fs::path sub{dir / fs::u8path(hex.substr(0, 2))};
+                const fs::path out{sub / fs::u8path(hex)};
+                if (fs::exists(out)) { ++skipped; continue; }
+                CBlockUndo undo;
+                if (!chainman.m_blockman.ReadBlockUndo(undo, *pindex)) throw JSONRPCError(RPC_MISC_ERROR, strprintf("no undo data for block %d", h));
+                fs::create_directories(sub);
+                fs::path tmp{out};
+                tmp += ".tmp";
+                {
+                    AutoFile file{fsbridge::fopen(tmp, "wb")};
+                    if (file.IsNull()) throw JSONRPCError(RPC_MISC_ERROR, "cannot write " + fs::PathToString(tmp));
+                    file << undo;
+                    if (file.fclose() != 0) throw JSONRPCError(RPC_MISC_ERROR, "write failed");
+                }
+                fs::rename(tmp, out);
+                ++files;
+                bytes += fs::file_size(out);
+                if (h % 50'000 == 0) LogInfo("SwiftSync undo export: block %d of %d, %u files, %u MB\n", h, height, files, bytes >> 20);
+            }
+            UniValue ret(UniValue::VOBJ);
+            ret.pushKV("files", files);
+            ret.pushKV("skipped", skipped);
+            ret.pushKV("bytes", bytes);
+            return ret;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -4500,6 +4560,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getchaintips},
         {"blockchain", &generateswiftsynchints},
         {"blockchain", &getswiftsyncinfo},
+        {"blockchain", &exportswiftsyncundo},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},

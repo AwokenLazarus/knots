@@ -3633,6 +3633,8 @@ bool Chainstate::SwiftSyncReady(const CBlockIndex& pindex)
     const CBlockIndex* end{best->GetAncestor(terminal)};
     if (!end || end->GetBlockHash() != sw->GetHints().TerminalHash()) return false;
     if (end->GetAncestor(pindex.nHeight) != &pindex) return false;
+    // A block whose only transaction is its coinbase spends nothing: its undo data is empty.
+    if (pindex.nTx == 1) return true;
     return sw->Undo().Have(pindex.GetBlockHash());
 }
 
@@ -3726,7 +3728,9 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         std::optional<swiftsync::UndoCoinsView> swift_view;
         if (swift) {
             const uint256 hash{pindexNew->GetBlockHash()};
-            if (sw->Undo().Read(hash, swift_undo)) swift_view.emplace(&CoinsTip(), blockConnecting, swift_undo);
+            if (blockConnecting.vtx.size() == 1 || sw->Undo().Read(hash, swift_undo)) {
+                swift_view.emplace(&CoinsTip(), blockConnecting, swift_undo);
+            }
             if (!swift_view || !swift_view->Matches()) {
                 LogWarning("SwiftSync: undo data for block %s is unreadable or doesn't match the block; fetching it again\n", hash.ToString());
                 sw->Undo().Erase(hash);

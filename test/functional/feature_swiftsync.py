@@ -78,6 +78,15 @@ class SwiftSyncTest(BitcoinTestFramework):
         assert_equal(a["txouts"], b["txouts"])
         assert_equal(a["total_amount"], b["total_amount"])
 
+        self.log.info("the undo export writes one file per block that spends something")
+        res = node0.exportswiftsyncundo("undo-export", hints["height"])
+        spending = sum(1 for h in range(1, hints["height"] + 1)
+                       if node0.getblock(node0.getblockhash(h))["nTx"] > 1)
+        assert_equal(res["files"], spending)
+        assert_equal(res["files"] + res["skipped"], hints["height"])
+        again = node0.exportswiftsyncundo("undo-export", hints["height"])
+        assert_equal(again["files"], 0)  # resumable: existing files are kept
+
         self.log.info("a wrong hint stops the sync instead of being accepted")
         data = bytearray(open(hints["path"], "rb").read())
         # Header is 8 + 4 + 4 + 32 bytes; flip the low bit of the last byte (a gap in the last block).

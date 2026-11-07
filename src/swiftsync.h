@@ -28,6 +28,7 @@
 #include <arith_uint256.h>
 #include <coins.h>
 #include <primitives/transaction.h>
+#include <streams.h>
 #include <sync.h>
 #include <uint256.h>
 #include <undo.h>
@@ -69,6 +70,7 @@ private:
     int m_height{-1};
     uint256 m_terminal_hash;
     std::vector<uint64_t> m_offsets; //!< file offset of each height's entry
+    mutable std::shared_ptr<AutoFile> m_file; //!< kept open: reopening per block is slow on phones
 };
 
 /** Salted sum (mod 2^256) of created-minus-spent coins below the terminal height. */
@@ -81,22 +83,24 @@ struct Aggregate {
     arith_uint256 Hash(const COutPoint& outpoint, const Coin& coin) const;
 };
 
-/** Undo data received from peers ahead of the blocks being connected, one file per block. */
+/** Undo data received from peers ahead of the blocks being connected, held in memory. */
 class UndoStore
 {
 public:
-    explicit UndoStore(fs::path dir);
+    static constexpr size_t MAX_BYTES{128 << 20};
+    explicit UndoStore(fs::path) {}
     bool Have(const uint256& block_hash) const;
     bool Read(const uint256& block_hash, CBlockUndo& undo) const;
     bool Write(const uint256& block_hash, const CBlockUndo& undo);
     void Erase(const uint256& block_hash);
     void Clear();
     size_t Count() const;
+    size_t Bytes() const { return m_bytes; }
+    bool Full() const { return m_bytes >= MAX_BYTES; }
 
 private:
-    fs::path File(const uint256& block_hash) const;
-    fs::path m_dir;
-    std::set<uint256> m_have; //!< what is on disk, so lookups need no filesystem call
+    std::map<uint256, std::pair<CBlockUndo, size_t>> m_undo;
+    size_t m_bytes{0};
 };
 
 /**
