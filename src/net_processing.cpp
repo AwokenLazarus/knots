@@ -1432,6 +1432,12 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
     // linked block we have in common with this peer. The +1 is so we can detect stalling, namely if we would be able to
     // download that next block if the window were 1 larger.
     int nWindowEnd = state->pindexLastCommonBlock->nHeight + BLOCK_DOWNLOAD_WINDOW;
+    // SwiftSync: blocks can arrive faster than their undo data, and the window above slides with
+    // downloaded blocks, not the tip, so downloads would run ahead without limit. Blocks above the
+    // tip can't be pruned, so on a phone that filled the disk. Keep them within a window of the tip.
+    if (auto* const sw{swiftsync::g_swiftsync.get()}; sw && !sw->Done()) {
+        nWindowEnd = std::min(nWindowEnd, m_chainman.ActiveChain().Height() + BLOCK_DOWNLOAD_WINDOW);
+    }
 
     FindNextBlocks(vBlocks, peer, state, pindexWalk, count, nWindowEnd, &m_chainman.ActiveChain(), &nodeStaller);
 }
