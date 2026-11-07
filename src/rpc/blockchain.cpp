@@ -4471,6 +4471,7 @@ static RPCHelpMan getswiftsyncinfo()
             {RPCResult::Type::NUM, "undo_bytes", /*optional=*/true, "bytes of undo data waiting in memory"},
             {RPCResult::Type::NUM, "undo_stored", /*optional=*/true, "blocks whose undo data has arrived and waits on disk"},
             {RPCResult::Type::NUM, "undo_failures", /*optional=*/true, "blocks whose served undo data failed and was fetched again"},
+            {RPCResult::Type::STR, "error", /*optional=*/true, "why SwiftSync can't go on, if it can't (fall back to an ordinary sync)"},
         }},
         RPCExamples{HelpExampleCli("getswiftsyncinfo", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
@@ -4484,6 +4485,7 @@ static RPCHelpMan getswiftsyncinfo()
                 ret.pushKV("undo_bytes", uint64_t(sw->Undo().Bytes()));
                 ret.pushKV("undo_stored", uint64_t(sw->Undo().Count()));
                 ret.pushKV("undo_failures", uint64_t(sw->m_undo_failures.size()));
+                if (!sw->m_error.empty()) ret.pushKV("error", sw->m_error);
             }
             return ret;
         },
@@ -4578,6 +4580,7 @@ static RPCHelpMan getswiftsyncwants()
                 const CBlockIndex* pindex{best->GetAncestor(h)};
                 if (!pindex) break;
                 if (pindex->nTx == 1 || sw->Undo().Have(pindex->GetBlockHash())) continue;
+                if (sw->m_bad_rpc_blocks.contains(pindex->GetBlockHash())) continue; // peers supply it
                 UniValue o(UniValue::VOBJ);
                 o.pushKV("height", h);
                 o.pushKV("hash", pindex->GetBlockHash().GetHex());
@@ -4616,7 +4619,8 @@ static RPCHelpMan submitswiftsyncundo()
                 auto* const sw{swiftsync::g_swiftsync.get()};
                 const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(hash)};
                 if (!sw || sw->Done() || !pindex || !sw->Covers(pindex->nHeight)) return false;
-                if (!sw->Undo().Have(hash)) sw->Undo().Write(hash, undo);
+                if (sw->m_bad_rpc_blocks.contains(hash)) return false; // file hosting's copy failed before
+                if (!sw->Undo().Have(hash)) sw->Undo().Write(hash, undo, swiftsync::SOURCE_RPC);
                 const CBlockIndex* tip{chainman.ActiveChain().Tip()};
                 resume = tip && pindex->pprev == tip && (pindex->nStatus & BLOCK_HAVE_DATA);
             }

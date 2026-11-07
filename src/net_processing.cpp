@@ -1634,6 +1634,7 @@ void PeerManagerImpl::MaybeRequestSwiftSyncUndo(CNode& node)
     auto* const sw{swiftsync::g_swiftsync.get()};
     if (!sw || sw->Done()) return;
     const NodeId id{node.GetId()};
+    if (sw->m_bad_peers.contains(id)) return; // its undo data failed a block
     const bool server{m_swiftsync_servers.contains(id)};
     if (!server && m_swiftsync_unanswered[id] >= 2) return;
     const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
@@ -4334,7 +4335,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 m_swiftsync_unanswered.erase(pfrom.GetId());
                 const CBlockIndex* pindex{m_chainman.m_blockman.LookupBlockIndex(hash)};
                 if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash)) continue;
-                sw->Undo().Write(hash, undo);
+                sw->Undo().Write(hash, undo, pfrom.GetId());
                 if (tip && pindex->pprev == tip && (pindex->nStatus & BLOCK_HAVE_DATA)) resume = true;
             }
         }
@@ -4385,7 +4386,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             m_swiftsync_unanswered.erase(pfrom.GetId());
             const CBlockIndex* pindex{m_chainman.m_blockman.LookupBlockIndex(hash)};
             if (!pindex || !sw->Covers(pindex->nHeight) || sw->Undo().Have(hash)) return;
-            if (!sw->Undo().Write(hash, undo)) {
+            if (!sw->Undo().Write(hash, undo, pfrom.GetId())) {
                 LogWarning("SwiftSync: cannot store undo data for %s\n", hash.ToString());
                 return;
             }

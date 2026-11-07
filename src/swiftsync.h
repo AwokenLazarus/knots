@@ -62,8 +62,11 @@ public:
     const uint256& TerminalHash() const { return m_terminal_hash; }
     const fs::path& Path() const { return m_path; }
 
-    /** Indices (in block output order) of the outputs of block `height` unspent at the terminal height. */
-    std::vector<uint32_t> Unspent(int height) const;
+    /**
+     * Indices (in block output order) of the outputs of block `height` unspent at the terminal height,
+     * or nullopt if the entry is malformed or names more than `outputs` outputs (the block's count).
+     */
+    std::optional<std::vector<uint32_t>> Unspent(int height, uint32_t outputs) const;
 
 private:
     fs::path m_path;
@@ -84,6 +87,9 @@ struct Aggregate {
 };
 
 /** Undo data received from peers ahead of the blocks being connected, held in memory. */
+/** Where a block's undo data came from: a peer's id, or RPC (an app fetching from file hosting). */
+static constexpr int64_t SOURCE_RPC{-1};
+
 class UndoStore
 {
 public:
@@ -91,7 +97,9 @@ public:
     explicit UndoStore(fs::path) {}
     bool Have(const uint256& block_hash) const;
     bool Read(const uint256& block_hash, CBlockUndo& undo) const;
-    bool Write(const uint256& block_hash, const CBlockUndo& undo);
+    bool Write(const uint256& block_hash, const CBlockUndo& undo, int64_t source = SOURCE_RPC);
+    /** The source of stored undo data, or nullopt. */
+    std::optional<int64_t> Source(const uint256& block_hash) const;
     void Erase(const uint256& block_hash);
     void Clear();
     size_t Count() const;
@@ -99,7 +107,12 @@ public:
     bool Full() const { return m_bytes >= MAX_BYTES; }
 
 private:
-    std::map<uint256, std::pair<CBlockUndo, size_t>> m_undo;
+    struct Entry {
+        CBlockUndo undo;
+        size_t bytes;
+        int64_t source;
+    };
+    std::map<uint256, Entry> m_undo;
     size_t m_bytes{0};
 };
 
@@ -146,6 +159,12 @@ public:
 
     /** Times the undo for a block failed to validate (bad data from a peer, re-requested). */
     std::map<uint256, int> m_undo_failures;
+    /** Peers whose undo data failed a block: no longer asked. */
+    std::set<int64_t> m_bad_peers;
+    /** Blocks whose undo data from file hosting (RPC) failed: fetched from peers instead. */
+    std::set<uint256> m_bad_rpc_blocks;
+    /** Set when SwiftSync can't go on (e.g. the hints are for a block not on this chain); the app falls back. */
+    std::string m_error;
 
 private:
     Hints m_hints;

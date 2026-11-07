@@ -46,6 +46,10 @@ std::optional<std::string> Hints::Load(const fs::path& path)
         int32_t height;
         file >> height >> m_terminal_hash;
         if (height < 1) return "hints file has no blocks";
+        // Every height takes at least one byte, so a height larger than the file is a lie; checking
+        // first keeps a crafted header from making us allocate gigabytes.
+        const int64_t size{int64_t(fs::file_size(path))};
+        if (height > size) return "hints file claims more blocks than it holds";
         m_offsets.resize(height + 1);
         for (int h = 0; h <= height; ++h) {
             m_offsets[h] = file.tell();
@@ -60,7 +64,7 @@ std::optional<std::string> Hints::Load(const fs::path& path)
     return std::nullopt;
 }
 
-std::vector<uint32_t> Hints::Unspent(int height) const
+std::optional<std::vector<uint32_t>> Hints::Unspent(int height, uint32_t outputs) const
 {
     std::vector<uint32_t> out;
     if (height < 0 || height > m_height) return out;
@@ -72,13 +76,21 @@ std::vector<uint32_t> Hints::Unspent(int height) const
         }
     }
     AutoFile& file{*m_file};
-    file.seek(m_offsets[height], SEEK_SET);
-    const uint64_t count = ReadCompactSize(file, /*range_check=*/false);
-    out.reserve(count);
-    int64_t prev = -1;
-    for (uint64_t i = 0; i < count; ++i) {
-        prev += 1 + int64_t(ReadCompactSize(file, /*range_check=*/false));
-        out.push_back(uint32_t(prev));
+    try {
+        file.seek(m_offsets[height], SEEK_SET);
+        const uint64_t count = ReadCompactSize(file, /*range_check=*/false);
+        if (count > outputs) return std::nullopt;
+        out.reserve(count);
+        int64_t prev = -1;
+        for (uint64_t i = 0; i < count; ++i) {
+            const uint64_t gap{ReadCompactSize(file, /*range_check=*/false)};
+            if (gap >= outputs) return std::nullopt;
+            prev += 1 + int64_t(gap);
+            if (prev >= int64_t(outputs)) return std::nullopt;
+            out.push_back(uint32_t(prev));
+        }
+    } catch (const std::exception&) {
+        return std::nullopt;
     }
     return out;
 }
@@ -104,22 +116,29 @@ bool UndoStore::Read(const uint256& block_hash, CBlockUndo& undo) const
 {
     auto it{m_undo.find(block_hash)};
     if (it == m_undo.end()) return false;
-    undo = it->second.first;
+    undo = it->second.undo;
     return true;
 }
 
-bool UndoStore::Write(const uint256& block_hash, const CBlockUndo& undo)
+bool UndoStore::Write(const uint256& block_hash, const CBlockUndo& undo, int64_t source)
 {
     const size_t bytes{GetSerializeSize(undo)};
-    if (m_undo.emplace(block_hash, std::make_pair(undo, bytes)).second) m_bytes += bytes;
+    if (m_undo.emplace(block_hash, Entry{undo, bytes, source}).second) m_bytes += bytes;
     return true;
+}
+
+std::optional<int64_t> UndoStore::Source(const uint256& block_hash) const
+{
+    auto it{m_undo.find(block_hash)};
+    if (it == m_undo.end()) return std::nullopt;
+    return it->second.source;
 }
 
 void UndoStore::Erase(const uint256& block_hash)
 {
     auto it{m_undo.find(block_hash)};
     if (it == m_undo.end()) return;
-    m_bytes -= it->second.second;
+    m_bytes -= it->second.bytes;
     m_undo.erase(it);
 }
 

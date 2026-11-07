@@ -13,6 +13,7 @@ instead of accepting the chain.
 import shutil
 
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_node import ErrorMatch
 from test_framework.util import assert_equal
 from test_framework.wallet import MiniWallet, MiniWalletMode
 
@@ -108,6 +109,50 @@ class SwiftSyncTest(BitcoinTestFramework):
         self.stop_node(2)
         shutil.rmtree(node2.chain_path / "blocks")
         shutil.rmtree(node2.chain_path / "chainstate")
+
+        self.log.info("a hints file that claims more blocks than it holds is refused at startup")
+        node2 = self.nodes[2]
+        good = open(hints["path"], "rb").read()
+        lie = bytearray(good[:48])
+        lie[12:16] = (0x7fffffff).to_bytes(4, "little")  # the height field
+        open(node2.chain_path / "lie.hints", "wb").write(bytes(lie))
+        self.stop_node(2) if node2.running else None
+        node2.assert_start_raises_init_error(["-swiftsync=lie.hints"],
+            "SwiftSync: hints file claims more blocks than it holds", match=ErrorMatch.PARTIAL_REGEX)
+
+        self.log.info("hints for a block not on this chain are reported, not waited on forever")
+        other = bytearray(good)
+        other[16:48] = bytes(32)  # a terminal hash no chain has
+        open(node2.chain_path / "other.hints", "wb").write(bytes(other))
+        self.start_node(2, extra_args=["-swiftsync=other.hints"])
+        self.connect_nodes(2, 0)
+        self.wait_until(lambda: "error" in node2.getswiftsyncinfo(), timeout=60)
+        assert_equal(node2.getswiftsyncinfo()["error"], "the hints are for a block that is not on this chain")
+        self.stop_node(2)
+        for d in ("blocks", "chainstate"):
+            shutil.rmtree(node2.chain_path / d, ignore_errors=True)
+
+        self.log.info("bad undo data from file hosting is blamed on it and fetched from a peer instead")
+        shutil.copy(hints["path"], node2.chain_path / "rpc.hints")
+        self.start_node(2, extra_args=["-swiftsync=rpc.hints"])
+        self.connect_nodes(0, 2)  # inbound to node2: no undo over P2P yet
+        export = node0.chain_path / "undo-export"
+        wants = []
+        self.wait_until(lambda: [w for w in node2.getswiftsyncwants(512) if (export / w["hash"][:2] / w["hash"]).exists()] and
+                        wants.extend(w for w in node2.getswiftsyncwants(512) if (export / w["hash"][:2] / w["hash"]).exists()) is None, timeout=60)
+        first, second = wants[0], wants[1]
+        # Hand the first spending block the second one's undo data: wrong for it.
+        wrong = (export / second["hash"][:2] / second["hash"]).read_bytes().hex()
+        assert node2.submitswiftsyncundo(first["hash"], wrong)
+        self.wait_until(lambda: node2.getswiftsyncinfo()["undo_failures"] >= 1, timeout=60)
+        assert first["hash"] not in [w["hash"] for w in node2.getswiftsyncwants(512)]
+        assert_equal(node2.submitswiftsyncundo(first["hash"], wrong), False)
+        self.connect_nodes(2, 0)  # now a manual peer that serves undo data
+        self.sync_blocks([node0, node2], timeout=120)
+        assert "SwiftSync complete" in node2.debug_log_path.read_text()
+        self.stop_node(2)
+        for d in ("blocks", "chainstate"):
+            shutil.rmtree(node2.chain_path / d, ignore_errors=True)
 
         self.log.info("a wrong hint stops the sync instead of being accepted")
         data = bytearray(open(hints["path"], "rb").read())

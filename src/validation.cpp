@@ -3631,7 +3631,16 @@ bool Chainstate::SwiftSyncReady(const CBlockIndex& pindex)
     const int terminal{sw->GetHints().Height()};
     if (!best || best->nHeight < terminal) return false;
     const CBlockIndex* end{best->GetAncestor(terminal)};
-    if (!end || end->GetBlockHash() != sw->GetHints().TerminalHash()) return false;
+    if (!end || end->GetBlockHash() != sw->GetHints().TerminalHash()) {
+        // Hints for a block that isn't on our best chain (a reorg, or the wrong file). Once the best
+        // chain is a few blocks past the terminal height that won't change: report it so the app
+        // can fall back to an ordinary sync instead of waiting forever.
+        if (best->nHeight >= terminal + 6 && sw->m_error.empty()) {
+            sw->m_error = "the hints are for a block that is not on this chain";
+            LogWarning("SwiftSync: %s\n", sw->m_error);
+        }
+        return false;
+    }
     if (end->GetAncestor(pindex.nHeight) != &pindex) return false;
     // A block whose only transaction is its coinbase spends nothing: its undo data is empty.
     if (pindex.nTx == 1) return true;
@@ -3645,7 +3654,13 @@ bool Chainstate::SwiftSyncApply(const CBlock& block, const CBlockIndex& pindex, 
     auto& agg{sw.Agg()};
     CCoinsViewCache& tip{CoinsTip()};
     const int height{pindex.nHeight};
-    const std::vector<uint32_t> unspent{sw.GetHints().Unspent(height)};
+    uint32_t outputs{0};
+    for (const auto& tx : block.vtx) outputs += tx->vout.size();
+    const auto hinted{sw.GetHints().Unspent(height, outputs)};
+    if (!hinted) {
+        return FatalError(m_chainman.GetNotifications(), state, _("SwiftSync hints are malformed for this block; the hints file is wrong. Restart without -swiftsync."));
+    }
+    const std::vector<uint32_t>& unspent{*hinted};
     // The two coinbases later overwritten by duplicates (BIP30) never become spendable coins.
     const bool overwritten{IsBIP30Unspendable(pindex)};
     size_t next{0};
@@ -3732,8 +3747,17 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
                 swift_view.emplace(&CoinsTip(), blockConnecting, swift_undo);
             }
             if (!swift_view || !swift_view->Matches()) {
-                LogWarning("SwiftSync: undo data for block %s is unreadable or doesn't match the block; fetching it again\n", hash.ToString());
+                // Same as a block failing with the data: blame the source and fetch it elsewhere.
+                const int failures{++sw->m_undo_failures[hash]};
+                const int64_t source{sw->Undo().Source(hash).value_or(swiftsync::SOURCE_RPC)};
+                LogWarning("SwiftSync: undo data for block %s from %s doesn't match the block, attempt %d\n", hash.ToString(),
+                           source == swiftsync::SOURCE_RPC ? "file hosting" : strprintf("peer=%d", source), failures);
+                if (source == swiftsync::SOURCE_RPC) sw->m_bad_rpc_blocks.insert(hash); else sw->m_bad_peers.insert(source);
                 sw->Undo().Erase(hash);
+                if (failures >= 3) {
+                    return FatalError(m_chainman.GetNotifications(), state,
+                        strprintf(_("SwiftSync could not validate block %s with the undo data its sources served. Restart without -swiftsync."), hash.ToString()));
+                }
                 m_swiftsync_waiting = true;
                 return false;
             }
@@ -3750,7 +3774,11 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
             // invalid. Never mark it so; fetch the data again, and give up after a few tries.
             const uint256 hash{pindexNew->GetBlockHash()};
             const int failures{++sw->m_undo_failures[hash]};
-            LogWarning("SwiftSync: block %s failed with the served undo data (%s), attempt %d\n", hash.ToString(), state.ToString(), failures);
+            const int64_t source{sw->Undo().Source(hash).value_or(swiftsync::SOURCE_RPC)};
+            LogWarning("SwiftSync: block %s failed with undo data from %s (%s), attempt %d\n", hash.ToString(),
+                       source == swiftsync::SOURCE_RPC ? "file hosting" : strprintf("peer=%d", source), state.ToString(), failures);
+            // Blame the source: a peer is no longer asked; data from file hosting is fetched from peers instead.
+            if (source == swiftsync::SOURCE_RPC) sw->m_bad_rpc_blocks.insert(hash); else sw->m_bad_peers.insert(source);
             sw->Undo().Erase(hash);
             if (failures >= 3) {
                 return FatalError(m_chainman.GetNotifications(), state,
@@ -5668,6 +5696,12 @@ bool Chainstate::ReplayBlocks()
 
     std::vector<uint256> hashHeads = db.GetHeadBlocks();
     if (hashHeads.empty()) return true; // We're already in a consistent state.
+    // A coins flush interrupted mid-SwiftSync can't be replayed: replay applies blocks the ordinary
+    // way, which doesn't match a UTXO set that holds only coins unspent at the terminal height.
+    if (auto saved{CoinsDB().GetSwiftSyncState()}; saved && swiftsync::StateActive(*saved)) {
+        LogError("ReplayBlocks(): a SwiftSync was interrupted while writing; it has to start again from genesis\n");
+        return false;
+    }
     if (hashHeads.size() != 2) {
         LogError("ReplayBlocks(): unknown inconsistent state\n");
         return false;
