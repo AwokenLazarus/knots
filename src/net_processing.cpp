@@ -1614,33 +1614,39 @@ void PeerManagerImpl::ReattemptInitialBroadcast(CScheduler& scheduler)
 
 void PeerManagerImpl::MaybeRequestSwiftSyncUndo(CNode& node)
 {
-    // How far ahead of the tip to fetch, and how many requests one peer may have open.
-    static constexpr int WINDOW{256};
-    static constexpr int PER_PEER{32};
-    static constexpr std::chrono::seconds TIMEOUT{60};
+    // How far ahead of the tip to fetch. A peer that has served undo data may have many requests
+    // open; one that hasn't yet gets a single probe, so blocks don't wait on peers that never
+    // answer (stock nodes ignore getswundo).
+    static constexpr int WINDOW{512};
+    static constexpr int PER_SERVER{128};
+    static constexpr std::chrono::seconds SERVER_TIMEOUT{60};
+    static constexpr std::chrono::seconds PROBE_TIMEOUT{15};
     if (!node.IsManualConn()) return;
     LOCK(cs_main);
     auto* const sw{swiftsync::g_swiftsync.get()};
     if (!sw || sw->Done()) return;
     const NodeId id{node.GetId()};
-    // A peer that never answers doesn't serve undo data: after a few tries, stop asking it.
-    if (!m_swiftsync_servers.contains(id) && m_swiftsync_unanswered[id] >= 4) return;
+    const bool server{m_swiftsync_servers.contains(id)};
+    if (!server && m_swiftsync_unanswered[id] >= 2) return;
     const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
     const CBlockIndex* best{m_chainman.m_best_header};
     if (!tip || !best) return;
     const auto now{GetTime<std::chrono::seconds>()};
     int open{0};
     for (auto it{m_swiftsync_inflight.begin()}; it != m_swiftsync_inflight.end();) {
-        if (now - it->second.second > TIMEOUT) {
-            if (it->second.first == id) ++m_swiftsync_unanswered[id];
+        const NodeId asked{it->second.first};
+        const auto timeout{m_swiftsync_servers.contains(asked) ? SERVER_TIMEOUT : PROBE_TIMEOUT};
+        if (now - it->second.second > timeout) {
+            ++m_swiftsync_unanswered[asked];
             it = m_swiftsync_inflight.erase(it);
             continue;
         }
-        if (it->second.first == id) ++open;
+        if (asked == id) ++open;
         ++it;
     }
+    const int limit{server ? PER_SERVER : 1};
     const int last{std::min({sw->GetHints().Height(), best->nHeight, tip->nHeight + WINDOW})};
-    for (int h = tip->nHeight + 1; h <= last && open < PER_PEER; ++h) {
+    for (int h = tip->nHeight + 1; h <= last && open < limit; ++h) {
         const CBlockIndex* pindex{best->GetAncestor(h)};
         if (!pindex) break;
         const uint256 hash{pindex->GetBlockHash()};
