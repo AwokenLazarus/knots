@@ -87,18 +87,41 @@ class SwiftSyncTest(BitcoinTestFramework):
         again = node0.exportswiftsyncundo("undo-export", hints["height"])
         assert_equal(again["files"], 0)  # resumable: existing files are kept
 
+        self.log.info("undo data can also arrive by RPC, as an app fetching from file hosting does it")
+        node2 = self.nodes[2]
+        shutil.copy(hints["path"], node2.chain_path / "rpc.hints")
+        self.restart_node(2, extra_args=["-swiftsync=rpc.hints", "-noconnect"])
+        # Headers and blocks from node0, but not as a manual peer, so no swundo comes over P2P.
+        self.connect_nodes(0, 2)  # inbound to node2: not a manual connection on its side
+        export = node0.chain_path / "undo-export"
+        def feed():
+            for want in node2.getswiftsyncwants(512):
+                f = export / want["hash"][:2] / want["hash"]
+                # No file means the block spends nothing (coinbase only): the node needs no undo data
+                # for it once the block itself arrives. File hosting answers 404 here.
+                if f.exists():
+                    node2.submitswiftsyncundo(want["hash"], f.read_bytes().hex())
+            return node2.getblockcount() >= node0.getblockcount()
+        self.wait_until(feed, timeout=120)
+        assert "SwiftSync complete" in node2.debug_log_path.read_text()
+        assert_equal(node2.getbestblockhash(), node0.getbestblockhash())
+        self.stop_node(2)
+        shutil.rmtree(node2.chain_path / "blocks")
+        shutil.rmtree(node2.chain_path / "chainstate")
+
         self.log.info("a wrong hint stops the sync instead of being accepted")
         data = bytearray(open(hints["path"], "rb").read())
         # Header is 8 + 4 + 4 + 32 bytes; flip the low bit of the last byte (a gap in the last block).
         data[-1] ^= 1
         bad = self.nodes[2].chain_path / "bad.hints"
         open(bad, "wb").write(bytes(data))
+        log_start = len(self.nodes[2].debug_log_path.read_text())
         self.restart_node(2, extra_args=["-swiftsync=bad.hints"])
         self.connect_nodes(2, 0)
         # The node stops itself with an error at the terminal height (or earlier, if the flipped
         # hint names an output that doesn't exist), and never gets past it.
         self.wait_until(lambda: self.nodes[2].process.poll() is not None, timeout=120)
-        log = self.nodes[2].debug_log_path.read_text()
+        log = self.nodes[2].debug_log_path.read_text()[log_start:]
         assert "hints file is wrong" in log or "SwiftSync failed" in log, "no SwiftSync error in the log"
         assert "SwiftSync complete" not in log
         self.nodes[2].running = False

@@ -4467,6 +4467,8 @@ static RPCHelpMan getswiftsyncinfo()
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "active", "whether blocks are being connected the SwiftSync way"},
             {RPCResult::Type::NUM, "terminal_height", /*optional=*/true, "where SwiftSync ends and its check happens"},
+            {RPCResult::Type::STR_HEX, "terminal_hash", /*optional=*/true, "the block hash at the terminal height (names the hints and undo files on file hosting)"},
+            {RPCResult::Type::NUM, "undo_bytes", /*optional=*/true, "bytes of undo data waiting in memory"},
             {RPCResult::Type::NUM, "undo_stored", /*optional=*/true, "blocks whose undo data has arrived and waits on disk"},
             {RPCResult::Type::NUM, "undo_failures", /*optional=*/true, "blocks whose served undo data failed and was fetched again"},
         }},
@@ -4478,6 +4480,8 @@ static RPCHelpMan getswiftsyncinfo()
             ret.pushKV("active", sw && !sw->Done());
             if (sw) {
                 ret.pushKV("terminal_height", sw->GetHints().Height());
+                ret.pushKV("terminal_hash", sw->GetHints().TerminalHash().GetHex());
+                ret.pushKV("undo_bytes", uint64_t(sw->Undo().Bytes()));
                 ret.pushKV("undo_stored", uint64_t(sw->Undo().Count()));
                 ret.pushKV("undo_failures", uint64_t(sw->m_undo_failures.size()));
             }
@@ -4545,6 +4549,86 @@ static RPCHelpMan exportswiftsyncundo()
     };
 }
 
+static RPCHelpMan getswiftsyncwants()
+{
+    return RPCHelpMan{"getswiftsyncwants",
+        "SwiftSync: the next blocks above the tip (on the best header chain) whose undo data hasn't arrived yet,\n"
+        "for a helper that fetches it from file hosting and hands it over with submitswiftsyncundo.\n"
+        "Blocks known to be coinbase-only are left out (they need none). Empty when SwiftSync isn't running\n"
+        "or the memory budget for waiting undo data is full.\n",
+        {
+            {"count", RPCArg::Type::NUM, RPCArg::Default{256}, "How many blocks ahead to look (at most 2048)."},
+        },
+        RPCResult{RPCResult::Type::ARR, "", "", {{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "height", "block height"},
+            {RPCResult::Type::STR_HEX, "hash", "block hash"},
+        }}}},
+        RPCExamples{HelpExampleCli("getswiftsyncwants", "256")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const int count{std::clamp(request.params[0].isNull() ? 256 : request.params[0].getInt<int>(), 1, 2048)};
+            UniValue ret(UniValue::VARR);
+            LOCK(cs_main);
+            auto* const sw{swiftsync::g_swiftsync.get()};
+            const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+            const CBlockIndex* best{chainman.m_best_header};
+            if (!sw || sw->Done() || !tip || !best || sw->Undo().Full()) return ret;
+            const int last{std::min({sw->GetHints().Height(), best->nHeight, tip->nHeight + count})};
+            for (int h = tip->nHeight + 1; h <= last; ++h) {
+                const CBlockIndex* pindex{best->GetAncestor(h)};
+                if (!pindex) break;
+                if (pindex->nTx == 1 || sw->Undo().Have(pindex->GetBlockHash())) continue;
+                UniValue o(UniValue::VOBJ);
+                o.pushKV("height", h);
+                o.pushKV("hash", pindex->GetBlockHash().GetHex());
+                ret.push_back(std::move(o));
+            }
+            return ret;
+        },
+    };
+}
+
+static RPCHelpMan submitswiftsyncundo()
+{
+    return RPCHelpMan{"submitswiftsyncundo",
+        "SwiftSync: hand over one block's undo data (as served by file hosting: a serialized CBlockUndo).\n"
+        "It is checked like data from a peer: against the block when it connects, and by the aggregate at the\n"
+        "terminal height. Returns false if the block isn't one SwiftSync needs.\n",
+        {
+            {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block's hash."},
+            {"undo", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The serialized undo data, hex encoded."},
+        },
+        RPCResult{RPCResult::Type::BOOL, "", "whether it was stored"},
+        RPCExamples{HelpExampleCli("submitswiftsyncundo", "\"<hash>\" \"<hex>\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const uint256 hash{ParseHashV(request.params[0], "blockhash")};
+            CBlockUndo undo;
+            try {
+                DataStream ds{ParseHexV(request.params[1], "undo")};
+                ds >> undo;
+            } catch (const std::exception&) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "undo data decode failed");
+            }
+            bool resume{false};
+            {
+                LOCK(cs_main);
+                auto* const sw{swiftsync::g_swiftsync.get()};
+                const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(hash)};
+                if (!sw || sw->Done() || !pindex || !sw->Covers(pindex->nHeight)) return false;
+                if (!sw->Undo().Have(hash)) sw->Undo().Write(hash, undo);
+                const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+                resume = tip && pindex->pprev == tip && (pindex->nStatus & BLOCK_HAVE_DATA);
+            }
+            if (resume) {
+                BlockValidationState state;
+                chainman.ActiveChainstate().ActivateBestChain(state);
+            }
+            return true;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -4561,6 +4645,8 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &generateswiftsynchints},
         {"blockchain", &getswiftsyncinfo},
         {"blockchain", &exportswiftsyncundo},
+        {"blockchain", &getswiftsyncwants},
+        {"blockchain", &submitswiftsyncundo},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},
