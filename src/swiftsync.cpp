@@ -14,6 +14,7 @@
 #include <streams.h>
 #include <tinyformat.h>
 #include <util/fs_helpers.h>
+#include <util/signalinterrupt.h>
 #include <validation.h>
 
 #include <algorithm>
@@ -252,7 +253,10 @@ std::optional<std::string> WriteHints(Chainstate& chainstate, const fs::path& pa
         if (!cursor->GetKey(key) || !cursor->GetValue(coin)) return "UTXO set read failed";
         if (coin.nHeight > uint32_t(height)) return "UTXO set changed during the snapshot";
         by_height[coin.nHeight].push_back(key);
-        if (++coins % 10'000'000 == 0) LogInfo("SwiftSync hints: read %u coins\n", coins);
+        if (++coins % 10'000'000 == 0) {
+            LogInfo("SwiftSync hints: read %u coins\n", coins);
+            if (static_cast<bool>(chainstate.m_chainman.m_interrupt)) return "stopped: the node is shutting down";
+        }
     }
     cursor.reset();
     LogInfo("SwiftSync hints: %u unspent coins at height %d\n", coins, height);
@@ -265,6 +269,12 @@ std::optional<std::string> WriteHints(Chainstate& chainstate, const fs::path& pa
     file.write(std::as_bytes(std::span{HINTS_MAGIC}));
     file << HINTS_VERSION << int32_t(height) << tip->GetBlockHash();
     for (int h = 0; h <= height; ++h) {
+        // The node can't finish shutting down while this RPC runs, so give way at once.
+        if (h % 1000 == 0 && static_cast<bool>(chainstate.m_chainman.m_interrupt)) {
+            file.fclose();
+            fs::remove(tmp);
+            return "stopped: the node is shutting down";
+        }
         std::vector<uint32_t> idx;
         if (!by_height[h].empty()) {
             const CBlockIndex* pindex{tip->GetAncestor(h)};

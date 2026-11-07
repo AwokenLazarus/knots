@@ -311,6 +311,7 @@ BASE_SCRIPTS = [
     'rpc_getblockfrompeer.py',
     'rpc_invalidateblock.py',
     'feature_utxo_set_hash.py',
+    'feature_swiftsync.py',
     'feature_rbf.py',
     'mempool_packages.py',
     'mempool_dead_branch.py',
