@@ -159,6 +159,43 @@ class SwiftSyncTest(BitcoinTestFramework):
         shutil.rmtree(node2.chain_path / "blocks")
         shutil.rmtree(node2.chain_path / "chainstate")
 
+        self.log.info("blocks can come in packs too: with headers only and no peers, packs alone reach the terminal")
+        node2 = self.nodes[2]
+        self.start_node(2, extra_args=["-swiftsync=pack.hints", "-noconnect"])
+        for h in range(1, node0.getblockcount() + 1):
+            node2.submitheader(node0.getblockheader(node0.getblockhash(h), False))
+        def write_block_pack(path, first, last, tamper=None):
+            blocks = [bytes.fromhex(node0.getblock(node0.getblockhash(h), 0)) for h in range(first, last + 1)]
+            if tamper is not None:
+                b = bytearray(blocks[tamper - first])
+                b[-5] ^= 1  # inside the last transaction: the header (and hash) stay, the merkle root no longer matches
+                blocks[tamper - first] = bytes(b)
+            with open(path, "wb") as out:
+                out.write(b"XBTBLKP1" + struct.pack("<IiiI", 1, first, last, len(blocks)))
+                for b in blocks:
+                    out.write(struct.pack("<I", len(b)) + b)
+        top = hints["height"]
+        bad_at = spenders[0]
+        write_block_pack(node2.chain_path / "b-bad", 1, top, tamper=bad_at)
+        r = node2.loadblockpack(str(node2.chain_path / "b-bad"))
+        assert_equal((r["blocks"], r["rejected"]), (top, 1))
+        assert_raises_rpc_error(-8, "not a block pack", node2.loadblockpack, str(node2.chain_path / "pack.hints"))
+        node2.loadswiftsyncundopack(str(node2.chain_path / "p1"))
+        node2.loadswiftsyncundopack(str(node2.chain_path / "p2"))
+        self.wait_until(lambda: node2.getblockcount() == bad_at - 1, timeout=60)
+        # The tampered copy didn't mark the real block invalid: the good copy is taken and the sync goes on.
+        assert not [t for t in node2.getchaintips() if t["status"] == "invalid"]
+        write_block_pack(node2.chain_path / "b-good", 1, node0.getblockcount())
+        r = node2.loadblockpack(str(node2.chain_path / "b-good"))
+        assert_equal(r["stored"], node0.getblockcount() - top + 1)  # the tampered one, and the blocks past the terminal
+        self.wait_until(lambda: node2.getblockcount() == node0.getblockcount(), timeout=120)
+        assert "SwiftSync complete" in node2.debug_log_path.read_text()
+        assert_equal(node2.gettxoutsetinfo("hash_serialized_3")["hash_serialized_3"], node0.gettxoutsetinfo("hash_serialized_3")["hash_serialized_3"])
+        assert_equal(node2.getconnectioncount(), 0)
+        self.stop_node(2)
+        shutil.rmtree(node2.chain_path / "blocks")
+        shutil.rmtree(node2.chain_path / "chainstate")
+
         self.log.info("a hints file that claims more blocks than it holds is refused at startup")
         node2 = self.nodes[2]
         good = open(hints["path"], "rb").read()

@@ -17,6 +17,8 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/params.h>
+#include <consensus/consensus.h>
+#include <crypto/common.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <dbwrapper.h>
@@ -76,7 +78,9 @@
 
 #include <stdint.h>
 
+#include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -4694,6 +4698,111 @@ static RPCHelpMan loadswiftsyncundopack()
     };
 }
 
+static RPCHelpMan loadblockpack()
+{
+    return RPCHelpMan{"loadblockpack",
+        "Store blocks from a block pack file (many consecutive blocks, as file hosting serves them in bulk)\n"
+        "as if they had come from a peer. Only blocks whose headers are already on the best header chain and\n"
+        "whose data the node doesn't have are taken; mutated blocks are skipped without judging the header.\n"
+        "Every block is fully validated when it connects, the same as any other. The call also connects what it\n"
+        "can (it may take a while; a call made while another is connecting returns once its blocks are stored).\n"
+        "Pack file (little endian): \"XBTBLKP1\", uint32 version (1), int32 first height, int32 last height,\n"
+        "uint32 block count; then per block a uint32 length and that many bytes of the serialized block.\n",
+        {
+            {"path", RPCArg::Type::STR, RPCArg::Optional::NO, "The pack file."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "first", "first height the pack covers"},
+            {RPCResult::Type::NUM, "last", "last height the pack covers"},
+            {RPCResult::Type::NUM, "blocks", "blocks in the pack"},
+            {RPCResult::Type::NUM, "stored", "blocks newly stored"},
+            {RPCResult::Type::NUM, "skipped", "blocks not needed (unknown, off the best header chain, or already stored)"},
+            {RPCResult::Type::NUM, "rejected", "blocks that failed checks (mutated or invalid)"},
+        }},
+        RPCExamples{HelpExampleCli("loadblockpack", "\"/path/to/pack\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const fs::path path{fs::u8path(request.params[0].get_str())};
+            std::FILE* raw{fsbridge::fopen(path, "rb")};
+            if (!raw) throw JSONRPCError(RPC_INVALID_PARAMETER, "cannot open the pack file");
+            AutoFile file{raw};
+            unsigned char head[24];
+            try {
+                file.read(MakeWritableByteSpan(head));
+            } catch (const std::exception&) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "not a block pack");
+            }
+            if (std::memcmp(head, "XBTBLKP1", 8) != 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "not a block pack");
+            if (ReadLE32(head + 8) != 1) throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown block pack version");
+            const int first{int32_t(ReadLE32(head + 12))};
+            const int last{int32_t(ReadLE32(head + 16))};
+            const uint32_t count{ReadLE32(head + 20)};
+            uint64_t stored{0}, skipped{0}, rejected{0};
+            uint32_t n{0};
+            try {
+                for (; n < count; ++n) {
+                    unsigned char lenb[4];
+                    file.read(MakeWritableByteSpan(lenb));
+                    const uint32_t len{ReadLE32(lenb)};
+                    if (len < 80 || len > MAX_BLOCK_SERIALIZED_SIZE) throw JSONRPCError(RPC_INVALID_PARAMETER, "bad block length in pack");
+                    std::vector<std::byte> buf(len);
+                    file.read(buf);
+                    auto block{std::make_shared<CBlock>()};
+                    DataStream ds{buf};
+                    ds >> TX_WITH_WITNESS(*block);
+                    const uint256 hash{block->GetHash()};
+                    LOCK(cs_main);
+                    const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(hash)};
+                    const CBlockIndex* best{chainman.m_best_header};
+                    if (!pindex || !best || best->GetAncestor(pindex->nHeight) != pindex || (pindex->nStatus & BLOCK_HAVE_DATA) || !pindex->pprev) {
+                        ++skipped;
+                        continue;
+                    }
+                    // Same guard as for a block from a peer: a mutated copy says nothing about the header.
+                    if (IsBlockMutated(*block, DeploymentActiveAfter(pindex->pprev, chainman, Consensus::DEPLOYMENT_SEGWIT))) {
+                        ++rejected;
+                        continue;
+                    }
+                    BlockValidationState state;
+                    bool fresh{false};
+                    if (chainman.AcceptBlock(block, state, nullptr, /*fRequested=*/true, /*dbp=*/nullptr, &fresh, /*min_pow_checked=*/true)) {
+                        if (fresh) ++stored; else ++skipped;
+                    } else {
+                        ++rejected;
+                    }
+                }
+            } catch (const UniValue&) {
+                throw;
+            } catch (const std::exception& e) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("truncated or corrupt block pack at block %u: %s", n, e.what()));
+            }
+            if (stored > 0) {
+                // Connect what can be connected now. One call at a time does it (activation can run long
+                // while blocks keep arriving); the others leave a note for it and return. Not on the
+                // scheduler thread: activation waits for the validation queue, which that thread drains.
+                static std::atomic<bool> running{false};
+                static std::atomic<bool> more{false};
+                more = true;
+                while (more && !running.exchange(true)) {
+                    while (more.exchange(false)) {
+                        BlockValidationState state;
+                        chainman.ActiveChainstate().ActivateBestChain(state);
+                    }
+                    running = false;
+                }
+            }
+            UniValue ret(UniValue::VOBJ);
+            ret.pushKV("first", first);
+            ret.pushKV("last", last);
+            ret.pushKV("blocks", uint64_t(count));
+            ret.pushKV("stored", stored);
+            ret.pushKV("skipped", skipped);
+            ret.pushKV("rejected", rejected);
+            return ret;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -4713,6 +4822,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getswiftsyncwants},
         {"blockchain", &submitswiftsyncundo},
         {"blockchain", &loadswiftsyncundopack},
+        {"blockchain", &loadblockpack},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},
