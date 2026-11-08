@@ -4480,6 +4480,7 @@ static RPCHelpMan getswiftsyncinfo()
             {RPCResult::Type::NUM, "pre_hits", /*optional=*/true, "blocks connected without checking their scripts again"},
             {RPCResult::Type::NUM, "pre_misses", /*optional=*/true, "blocks connected with full script checks"},
             {RPCResult::Type::NUM, "pre_waited", /*optional=*/true, "connects that waited for a worker still checking the block"},
+            {RPCResult::Type::NUM, "pre_duty", /*optional=*/true, "share of the time workers spend checking (setswiftsyncduty)"},
             {RPCResult::Type::NUM, "undo_failures", /*optional=*/true, "blocks whose served undo data failed and was fetched again"},
             {RPCResult::Type::STR, "error", /*optional=*/true, "why SwiftSync can't go on, if it can't (fall back to an ordinary sync)"},
         }},
@@ -4500,10 +4501,33 @@ static RPCHelpMan getswiftsyncinfo()
                 ret.pushKV("pre_hits", sw->Pre().m_hits.load());
                 ret.pushKV("pre_misses", sw->Pre().m_misses.load());
                 ret.pushKV("pre_waited", sw->Pre().m_waited.load());
+                ret.pushKV("pre_duty", sw->m_pre_duty.load());
                 ret.pushKV("undo_failures", uint64_t(sw->m_undo_failures.size()));
                 if (!sw->m_error.empty()) ret.pushKV("error", sw->m_error);
             }
             return ret;
+        },
+    };
+}
+
+static RPCHelpMan setswiftsyncduty()
+{
+    return RPCHelpMan{"setswiftsyncduty",
+        "Sets the share of the time SwiftSync's script pre-validation workers spend checking (10-100).\n"
+        "Lower values keep every core at part load, so a phone's shared cluster clock can drop: less\n"
+        "heat per signature checked than fewer cores at full load.\n",
+        {
+            {"percent", RPCArg::Type::NUM, RPCArg::Optional::NO, "10 to 100"},
+        },
+        RPCResult{RPCResult::Type::NUM, "", "the duty now in effect"},
+        RPCExamples{HelpExampleCli("setswiftsyncduty", "50")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            const int percent{request.params[0].getInt<int>()};
+            if (percent < 10 || percent > 100) throw JSONRPCError(RPC_INVALID_PARAMETER, "percent must be 10 to 100");
+            auto* const sw{swiftsync::g_swiftsync.get()};
+            if (!sw) throw JSONRPCError(RPC_MISC_ERROR, "SwiftSync is not active");
+            sw->m_pre_duty = percent;
+            return percent;
         },
     };
 }
@@ -4833,6 +4857,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getchaintips},
         {"blockchain", &generateswiftsynchints},
         {"blockchain", &getswiftsyncinfo},
+        {"blockchain", &setswiftsyncduty},
         {"blockchain", &exportswiftsyncundo},
         {"blockchain", &getswiftsyncwants},
         {"blockchain", &submitswiftsyncundo},

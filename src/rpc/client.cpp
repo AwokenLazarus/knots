@@ -72,6 +72,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getblockhash", 0, "height" },
     { "exportswiftsyncundo", 1, "height" },
     { "getswiftsyncwants", 0, "count" },
+    { "setswiftsyncduty", 0, "percent" },
     { "maxmempool", 0, "megabytes" },
     { "waitforblockheight", 0, "height" },
     { "waitforblockheight", 1, "timeout" },

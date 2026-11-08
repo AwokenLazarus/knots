@@ -199,7 +199,10 @@ class SwiftSyncTest(BitcoinTestFramework):
         assert not [t for t in node2.getchaintips() if t["status"] == "invalid"]
         # While the tip waits for the good copy, the blocks above it (stored, with undo data) get
         # their scripts checked on worker threads; they then connect without a second check.
+        assert_equal(node2.setswiftsyncduty(40), 40)  # part load: slower, but every block still checked once
+        assert_raises_rpc_error(-8, "percent must be 10 to 100", node2.setswiftsyncduty, 5)
         self.wait_until(lambda: node2.getswiftsyncinfo()["pre_checked"] >= 20, timeout=60)
+        node2.setswiftsyncduty(100)
         write_block_pack(node2.chain_path / "b-good", 1, node0.getblockcount())
         r = node2.loadblockpack(str(node2.chain_path / "b-good"))
         assert_equal(r["stored"], node0.getblockcount() - top + 1)  # the tampered one, and the blocks past the terminal

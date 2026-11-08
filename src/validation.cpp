@@ -3667,8 +3667,11 @@ constexpr int PREVALIDATE_LOOKAHEAD{256};
  * is then checked in full when it connects, which reports them.
  */
 bool PrevalidateScripts(const CBlock& block, const CBlockUndo& undo, int height, unsigned int flags,
-                        int reduced_data_start_height, SignatureCache& sigcache, const std::atomic<bool>& stop)
+                        int reduced_data_start_height, SignatureCache& sigcache, const std::atomic<bool>& stop,
+                        const std::atomic<int>& duty)
 {
+    // Rest owed under the duty limit; slept in pieces of at least 2 ms so it costs few wakeups.
+    std::chrono::nanoseconds debt{0};
     if (undo.vtxundo.size() + 1 != block.vtx.size()) return false;
     std::unordered_map<uint256, size_t, SaltedTxidHasher> index;
     index.reserve(block.vtx.size());
@@ -3700,12 +3703,20 @@ bool PrevalidateScripts(const CBlock& block, const CBlockUndo& undo, int height,
                 flags_per_input[j] = flags & ~REDUCED_DATA_MANDATORY_VERIFY_FLAGS;
             }
         }
+        const auto work_start{std::chrono::steady_clock::now()};
         PrecomputedTransactionData txdata;
         txdata.Init(tx, std::move(spent), /*force=*/!!(flags & SCRIPT_VERIFY_UNIFIED_SIGHASH));
         for (unsigned int j = 0; j < tx.vin.size(); ++j) {
             const unsigned int f{flags_per_input.empty() ? flags : flags_per_input[j]};
             CScriptCheck check{txdata.m_spent_outputs[j], tx, sigcache, j, f, /*cacheIn=*/false, &txdata};
             if (check().has_value()) return false;
+        }
+        if (const int d{std::clamp(duty.load(), 10, 100)}; d < 100) {
+            debt += (std::chrono::steady_clock::now() - work_start) * (100 - d) / d;
+            if (debt >= std::chrono::milliseconds{2}) {
+                std::this_thread::sleep_for(debt);
+                debt = std::chrono::nanoseconds{0};
+            }
         }
     }
     return true;
@@ -3797,7 +3808,7 @@ void StartSwiftSyncPrevalidation(ChainstateManager& chainman, int threads)
                 CBlock block;
                 const bool ok{chainman.m_blockman.ReadBlock(block, job->pos, job->hash) &&
                               PrevalidateScripts(block, job->undo, job->height, job->flags, job->reduced_data_start_height,
-                                                 chainman.m_validation_cache.m_signature_cache, sw->m_pre_stop)};
+                                                 chainman.m_validation_cache.m_signature_cache, sw->m_pre_stop, sw->m_pre_duty)};
                 if (sw->m_pre_stop) return;
                 ++(ok ? sw->Pre().m_checked : sw->Pre().m_failed);
                 sw->Pre().Finish(job->hash, ok, swiftsync::UndoHash(job->undo));

@@ -240,6 +240,13 @@ public:
     /** Pre-validation threads (started by StartSwiftSyncPrevalidation); stopped before shutdown. */
     std::vector<std::thread> m_pre_threads;
     std::atomic<bool> m_pre_stop{false};
+    /**
+     * Share of the time (10-100%) each pre-validation worker spends checking: after each
+     * transaction it rests in proportion to the work just done. On a phone the cores of a cluster
+     * share one clock, set by the busiest core; fewer cores at full load push that clock (and the
+     * energy per signature) up, while all cores at part load let it drop. setswiftsyncduty sets it.
+     */
+    std::atomic<int> m_pre_duty{100};
     void StopPrevalidation();
 
     /** Whether block `height` must be connected the SwiftSync way. */
