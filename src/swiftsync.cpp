@@ -310,6 +310,52 @@ bool UndoCoinsView::HaveCoin(const COutPoint& outpoint) const
     return m_spent.contains(outpoint) || CCoinsViewBacked::HaveCoin(outpoint);
 }
 
+// ---- script pre-validation -----------------------------------------------------------------
+
+uint256 UndoHash(const CBlockUndo& undo)
+{
+    HashWriter hw{};
+    hw << undo;
+    return hw.GetSHA256();
+}
+
+void Prevalidated::Add(const uint256& block, const uint256& undo)
+{
+    LOCK(m_mutex);
+    m_ok[block] = undo;
+}
+
+bool Prevalidated::Take(const uint256& block, const uint256& undo)
+{
+    LOCK(m_mutex);
+    auto it{m_ok.find(block)};
+    if (it == m_ok.end()) return false;
+    const bool match{it->second == undo};
+    m_ok.erase(it);
+    return match;
+}
+
+bool Prevalidated::Has(const uint256& block) const
+{
+    LOCK(m_mutex);
+    return m_ok.contains(block);
+}
+
+size_t Prevalidated::Size() const
+{
+    LOCK(m_mutex);
+    return m_ok.size();
+}
+
+void SwiftSync::StopPrevalidation()
+{
+    m_pre_stop = true;
+    for (auto& t : m_pre_threads) {
+        if (t.joinable()) t.join();
+    }
+    m_pre_threads.clear();
+}
+
 // ---- state ---------------------------------------------------------------------------------
 
 std::vector<unsigned char> SwiftSync::Serialize() const

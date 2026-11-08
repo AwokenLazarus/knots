@@ -66,6 +66,7 @@
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/string.h>
+#include <util/threadnames.h>
 #include <util/time.h>
 #include <util/trace.h>
 #include <util/translation.h>
@@ -2770,7 +2771,7 @@ static bool ContextualCheckBlockHeaderVolatile(const CBlockHeader& block, BlockV
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
 bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                               CCoinsViewCache& view, bool fJustCheck)
+                               CCoinsViewCache& view, bool fJustCheck, bool scripts_checked)
 {
     AssertLockHeld(cs_main);
     assert(pindex);
@@ -2826,8 +2827,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return true;
     }
 
-    bool fScriptChecks = true;
-    if (!m_chainman.AssumedValidBlock().IsNull()) {
+    bool fScriptChecks = !scripts_checked;
+    if (fScriptChecks && !m_chainman.AssumedValidBlock().IsNull()) {
         // We've been configured with the hash of a block which has been externally verified to have a valid history.
         // A suitable default value is included with the software and updated from time to time.  Because validity
         //  relative to a piece of software is an objective fact these defaults can be easily reviewed.
@@ -3653,6 +3654,136 @@ bool Chainstate::SwiftSyncReady(const CBlockIndex& pindex)
     return sw->Undo().Have(pindex.GetBlockHash());
 }
 
+namespace {
+/** How far above the tip pre-validation looks for blocks it can check. */
+constexpr int PREVALIDATE_LOOKAHEAD{256};
+
+/**
+ * One SwiftSync block's scripts, checked as ConnectBlock's CheckInputScripts would check them:
+ * the same flags (per input under RDTS), the same spent outputs (from the block itself for outputs
+ * it creates and spends, else from its undo data), the same precomputed sighash data. True only
+ * if every script passes. Shape errors (undo not matching the block) count as failures: the block
+ * is then checked in full when it connects, which reports them.
+ */
+bool PrevalidateScripts(const CBlock& block, const CBlockUndo& undo, int height, unsigned int flags,
+                        int reduced_data_start_height, SignatureCache& sigcache, const std::atomic<bool>& stop)
+{
+    if (undo.vtxundo.size() + 1 != block.vtx.size()) return false;
+    std::unordered_map<uint256, size_t, SaltedTxidHasher> index;
+    index.reserve(block.vtx.size());
+    for (size_t i = 0; i < block.vtx.size(); ++i) index.emplace(block.vtx[i]->GetHash().ToUint256(), i);
+    for (size_t i = 1; i < block.vtx.size(); ++i) {
+        if (stop) return false;
+        const CTransaction& tx{*block.vtx[i]};
+        const CTxUndo& txundo{undo.vtxundo[i - 1]};
+        if (txundo.vprevout.size() != tx.vin.size()) return false;
+        std::vector<CTxOut> spent;
+        spent.reserve(tx.vin.size());
+        std::vector<unsigned int> flags_per_input;
+        for (size_t j = 0; j < tx.vin.size(); ++j) {
+            const COutPoint& prevout{tx.vin[j].prevout};
+            int prevheight;
+            if (auto it{index.find(prevout.hash.ToUint256())}; it != index.end()) {
+                // Created in this block: ConnectBlock's view serves it from the block, and only if an
+                // earlier transaction created it (else the input is missing and the block invalid).
+                const CTransaction& parent{*block.vtx[it->second]};
+                if (it->second >= i || prevout.n >= parent.vout.size()) return false;
+                spent.push_back(parent.vout[prevout.n]);
+                prevheight = height;
+            } else {
+                spent.push_back(txundo.vprevout[j].out);
+                prevheight = txundo.vprevout[j].nHeight;
+            }
+            if (prevheight < reduced_data_start_height) {
+                flags_per_input.resize(tx.vin.size(), flags);
+                flags_per_input[j] = flags & ~REDUCED_DATA_MANDATORY_VERIFY_FLAGS;
+            }
+        }
+        PrecomputedTransactionData txdata;
+        txdata.Init(tx, std::move(spent), /*force=*/!!(flags & SCRIPT_VERIFY_UNIFIED_SIGHASH));
+        for (unsigned int j = 0; j < tx.vin.size(); ++j) {
+            const unsigned int f{flags_per_input.empty() ? flags : flags_per_input[j]};
+            CScriptCheck check{txdata.m_spent_outputs[j], tx, sigcache, j, f, /*cacheIn=*/false, &txdata};
+            if (check().has_value()) return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
+void StartSwiftSyncPrevalidation(ChainstateManager& chainman, int threads)
+{
+    auto* const sw{swiftsync::g_swiftsync.get()};
+    if (!sw || sw->Done() || threads <= 0) return;
+    // Blocks taken by a worker and not yet finished; shared by the workers.
+    auto claimed{std::make_shared<std::pair<Mutex, std::set<uint256>>>()};
+    for (int t = 0; t < threads; ++t) {
+        sw->m_pre_threads.emplace_back([&chainman, sw, claimed, t] {
+            util::ThreadRename(strprintf("swiftpre.%i", t));
+            while (!sw->m_pre_stop && !sw->Done()) {
+                // Pick the lowest block above the tip that has its data and undo data and isn't done.
+                std::optional<uint256> hash;
+                int height{0};
+                FlatFilePos pos;
+                unsigned int flags{0};
+                int reduced_data_start_height{0};
+                CBlockUndo undo;
+                {
+                    LOCK(cs_main);
+                    Chainstate& active{chainman.ActiveChainstate()};
+                    const CBlockIndex* best{chainman.m_best_header};
+                    const int tip{active.m_chain.Height()};
+                    if (best) {
+                        const int top{std::min({best->nHeight, tip + PREVALIDATE_LOOKAHEAD, sw->GetHints().Height()})};
+                        for (int h = tip + 1; h <= top && !hash; ++h) {
+                            const CBlockIndex* p{best->GetAncestor(h)};
+                            if (!p || !(p->nStatus & BLOCK_HAVE_DATA) || p->nTx <= 1) continue;
+                            const uint256 bh{p->GetBlockHash()};
+                            if (sw->Pre().Has(bh) || !sw->Undo().Have(bh)) continue;
+                            {
+                                LOCK(claimed->first);
+                                if (!claimed->second.insert(bh).second) continue;
+                            }
+                            if (!sw->Undo().Read(bh, undo)) {
+                                LOCK(claimed->first);
+                                claimed->second.erase(bh);
+                                continue;
+                            }
+                            hash = bh;
+                            height = h;
+                            pos = p->GetBlockPos();
+                            flags = GetBlockScriptFlags(*p, chainman);
+                            const auto& consensus{chainman.GetParams().GetConsensus()};
+                            reduced_data_start_height = consensus.RdtsActiveAt(h, Assert(p->pprev)->GetMedianTimePast())
+                                ? consensus.RdtsActivationHeight() : 0;
+                        }
+                    }
+                }
+                if (!hash) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                    continue;
+                }
+                CBlock block;
+                const bool ok{chainman.m_blockman.ReadBlock(block, pos, *hash) &&
+                              PrevalidateScripts(block, undo, height, flags, reduced_data_start_height,
+                                                 chainman.m_validation_cache.m_signature_cache, sw->m_pre_stop)};
+                if (ok) {
+                    sw->Pre().Add(*hash, swiftsync::UndoHash(undo));
+                    ++sw->Pre().m_checked;
+                } else if (!sw->m_pre_stop) {
+                    ++sw->Pre().m_failed;
+                }
+                // A failed block stays claimed: it isn't tried again; it is checked in full when it connects.
+                if (ok) {
+                    LOCK(claimed->first);
+                    claimed->second.erase(*hash);
+                }
+            }
+        });
+    }
+    LogInfo("SwiftSync: checking scripts of blocks ahead of the tip on %d threads\n", threads);
+}
+
 bool Chainstate::SwiftSyncApply(const CBlock& block, const CBlockIndex& pindex, const CBlockUndo& undo, BlockValidationState& state)
 {
     AssertLockHeld(cs_main);
@@ -3778,7 +3909,13 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
             }
         }
         CCoinsViewCache view(swift ? static_cast<CCoinsView*>(&*swift_view) : &CoinsTip());
-        bool rv = ConnectBlock(blockConnecting, state, pindexNew, view);
+        // Scripts already checked ahead of the tip against exactly this undo data are not checked again.
+        bool prechecked{false};
+        if (swift && blockConnecting.vtx.size() > 1) {
+            prechecked = sw->Pre().Take(pindexNew->GetBlockHash(), swiftsync::UndoHash(swift_undo));
+            ++(prechecked ? sw->Pre().m_hits : sw->Pre().m_misses);
+        }
+        bool rv = ConnectBlock(blockConnecting, state, pindexNew, view, /*fJustCheck=*/false, /*scripts_checked=*/prechecked);
         // A SwiftSync failure may be the served undo data's fault, not the block's: don't report it
         // as a bad block (that would punish the peer that sent the block).
         if (m_chainman.m_options.signals && (rv || !swift)) {

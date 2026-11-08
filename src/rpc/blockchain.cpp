@@ -4475,6 +4475,10 @@ static RPCHelpMan getswiftsyncinfo()
             {RPCResult::Type::NUM, "undo_bytes", /*optional=*/true, "bytes of undo data waiting in memory"},
             {RPCResult::Type::NUM, "undo_stored", /*optional=*/true, "blocks whose undo data has arrived and waits (in memory or in packs)"},
             {RPCResult::Type::NUM, "undo_packed", /*optional=*/true, "of those, blocks whose undo data waits in pack files on disk"},
+            {RPCResult::Type::NUM, "pre_checked", /*optional=*/true, "blocks whose scripts pre-validation checked ahead of the tip"},
+            {RPCResult::Type::NUM, "pre_failed", /*optional=*/true, "blocks pre-validation found a failing script in (checked in full when they connect)"},
+            {RPCResult::Type::NUM, "pre_hits", /*optional=*/true, "blocks connected without checking their scripts again"},
+            {RPCResult::Type::NUM, "pre_misses", /*optional=*/true, "blocks connected with full script checks"},
             {RPCResult::Type::NUM, "undo_failures", /*optional=*/true, "blocks whose served undo data failed and was fetched again"},
             {RPCResult::Type::STR, "error", /*optional=*/true, "why SwiftSync can't go on, if it can't (fall back to an ordinary sync)"},
         }},
@@ -4490,6 +4494,10 @@ static RPCHelpMan getswiftsyncinfo()
                 ret.pushKV("undo_bytes", uint64_t(sw->Undo().Bytes()));
                 ret.pushKV("undo_stored", uint64_t(sw->Undo().Count()));
                 ret.pushKV("undo_packed", uint64_t(sw->Undo().PackedCount()));
+                ret.pushKV("pre_checked", sw->Pre().m_checked.load());
+                ret.pushKV("pre_failed", sw->Pre().m_failed.load());
+                ret.pushKV("pre_hits", sw->Pre().m_hits.load());
+                ret.pushKV("pre_misses", sw->Pre().m_misses.load());
                 ret.pushKV("undo_failures", uint64_t(sw->m_undo_failures.size()));
                 if (!sw->m_error.empty()) ret.pushKV("error", sw->m_error);
             }
@@ -4776,8 +4784,12 @@ static RPCHelpMan loadblockpack()
             } catch (const std::exception& e) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("truncated or corrupt block pack at block %u: %s", n, e.what()));
             }
-            if (stored > 0) {
+            // A pack whose blocks peers already sent still shows packs are coming: keep peers to the
+            // gaps above the tip (else they take over the whole window and packs only bring copies).
+            if (stored + skipped > 0) {
                 if (auto* const sw{swiftsync::g_swiftsync.get()}) sw->NotePackStored();
+            }
+            if (stored > 0) {
                 // Connect what can be connected now. One call at a time does it (activation can run long
                 // while blocks keep arriving); the others leave a note for it and return. Not on the
                 // scheduler thread: activation waits for the validation queue, which that thread drains.

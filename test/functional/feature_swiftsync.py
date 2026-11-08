@@ -80,6 +80,12 @@ class SwiftSyncTest(BitcoinTestFramework):
         assert_equal(a["txouts"], b["txouts"])
         assert_equal(a["total_amount"], b["total_amount"])
 
+        self.log.info("scripts of blocks ahead of the tip were checked on worker threads")
+        info = self.nodes[1].getswiftsyncinfo()
+        self.log.info(f"pre-validation: {info['pre_checked']} checked, {info['pre_hits']} connected without a second check, {info['pre_misses']} with one")
+        assert_equal(info["pre_failed"], 0)
+        assert info["pre_hits"] + info["pre_misses"] > 0
+
         self.log.info("undo data is written only for the last 288 blocks below the terminal height")
         deep = hints["height"] - 288
         assert_raises_rpc_error(-1, "Undo data not available", self.nodes[1].getblockstats, deep)
@@ -191,6 +197,9 @@ class SwiftSyncTest(BitcoinTestFramework):
         self.wait_until(lambda: node2.getblockcount() == bad_at - 1, timeout=60)
         # The tampered copy didn't mark the real block invalid: the good copy is taken and the sync goes on.
         assert not [t for t in node2.getchaintips() if t["status"] == "invalid"]
+        # While the tip waits for the good copy, the blocks above it (stored, with undo data) get
+        # their scripts checked on worker threads; they then connect without a second check.
+        self.wait_until(lambda: node2.getswiftsyncinfo()["pre_checked"] >= 20, timeout=60)
         write_block_pack(node2.chain_path / "b-good", 1, node0.getblockcount())
         r = node2.loadblockpack(str(node2.chain_path / "b-good"))
         assert_equal(r["stored"], node0.getblockcount() - top + 1)  # the tampered one, and the blocks past the terminal
@@ -198,6 +207,10 @@ class SwiftSyncTest(BitcoinTestFramework):
         assert "SwiftSync complete" in node2.debug_log_path.read_text()
         assert_equal(node2.gettxoutsetinfo("hash_serialized_3")["hash_serialized_3"], node0.gettxoutsetinfo("hash_serialized_3")["hash_serialized_3"])
         assert_equal(node2.getconnectioncount(), 0)
+        info = node2.getswiftsyncinfo()
+        self.log.info(f"pre-validation: {info['pre_checked']} checked, {info['pre_hits']} connected without a second check, {info['pre_misses']} with one")
+        assert info["pre_hits"] >= 20
+        assert_equal(info["pre_failed"], 0)
         self.stop_node(2)
         shutil.rmtree(node2.chain_path / "blocks")
         shutil.rmtree(node2.chain_path / "chainstate")

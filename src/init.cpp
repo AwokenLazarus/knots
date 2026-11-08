@@ -342,6 +342,7 @@ void Shutdown(NodeContext& node)
 
     // After the threads that potentially access these pointers have been stopped,
     // destruct and reset all to nullptr.
+    if (swiftsync::g_swiftsync) swiftsync::g_swiftsync->StopPrevalidation();
     node.peerman.reset();
     node.connman.reset();
     node.banman.reset();
@@ -493,6 +494,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-alertnotify=<cmd>", "Execute command when an alert is raised (%s in cmd is replaced by message)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-swiftsync=<file>", "Sync faster from the genesis block with a SwiftSync hints file (made by the generateswiftsynchints RPC). Every block and signature is still checked; manually added peers that serve undo data (swundo) are required. Relative paths are to the network data directory.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-swiftsyncprevalidate", "With -swiftsync, check the scripts of blocks ahead of the tip on worker threads, each block on its own, so connecting them skips that work (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-assumevalid=<hex>", strprintf("If this block is in the chain assume that it and its ancestors are valid and potentially skip their script verification (0 to verify all, default: %s, testnet3: %s, testnet4: %s, signet: %s)", defaultChainParams->GetConsensus().defaultAssumeValid.GetHex(), testnetChainParams->GetConsensus().defaultAssumeValid.GetHex(), testnet4ChainParams->GetConsensus().defaultAssumeValid.GetHex(), signetChainParams->GetConsensus().defaultAssumeValid.GetHex()), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksdir=<dir>", "Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksxor",
@@ -2138,6 +2140,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                     sw->GetHints().Height(), sw->GetHints().TerminalHash().ToString(), sw->Undo().Count());
             swiftsync::g_swiftsync = std::move(sw);
         }
+    }
+    // SwiftSync blocks can be checked out of order: their scripts need only the block, its undo
+    // data and the header chain. Workers check them ahead of the tip, so the cores stay busy
+    // across block boundaries instead of waiting for each block's serial part.
+    if (swiftsync::g_swiftsync && args.GetBoolArg("-swiftsyncprevalidate", true)) {
+        StartSwiftSyncPrevalidation(chainman, std::max(1, chainman.m_options.worker_threads_num));
     }
 
     assert(!node.peerman);

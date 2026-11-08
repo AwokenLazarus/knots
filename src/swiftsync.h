@@ -45,6 +45,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -176,15 +177,53 @@ private:
     bool m_matches{true};
 };
 
+/** SHA-256 of a block's serialized undo data: names the exact data a script pre-validation used. */
+uint256 UndoHash(const CBlockUndo& undo);
+
+/**
+ * Script pre-validation: worker threads check every script of blocks above the tip, each block
+ * on its own, from the block, its undo data and the header chain (see
+ * StartSwiftSyncPrevalidation). A block that passed is noted with the hash of the undo data it
+ * was checked against; ConnectBlock then skips its script checks only when it connects the block
+ * with exactly that undo data, and checks everything else as always. The results are this node's
+ * own, so nothing is trusted that wasn't verified here; wrong undo data is still caught by the
+ * aggregate at the terminal height, as without pre-validation.
+ */
+class Prevalidated
+{
+public:
+    void Add(const uint256& block, const uint256& undo) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    /** Whether `block` passed with this undo data; forgets it either way. */
+    bool Take(const uint256& block, const uint256& undo) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool Has(const uint256& block) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    size_t Size() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
+    std::atomic<uint64_t> m_checked{0}; //!< blocks whose scripts all passed
+    std::atomic<uint64_t> m_failed{0};  //!< blocks a script failed in (checked again when they connect)
+    std::atomic<uint64_t> m_hits{0};    //!< blocks connected without checking their scripts again
+    std::atomic<uint64_t> m_misses{0};  //!< blocks connected with full script checks
+
+private:
+    mutable Mutex m_mutex;
+    std::map<uint256, uint256> m_ok GUARDED_BY(m_mutex);
+};
+
 /** The node's SwiftSync state: active from startup with -swiftsync until the terminal height. */
 class SwiftSync
 {
 public:
     SwiftSync(Hints hints, fs::path undo_dir) : m_hints(std::move(hints)), m_undo(std::move(undo_dir)) {}
+    ~SwiftSync() { StopPrevalidation(); }
 
     const Hints& GetHints() const { return m_hints; }
     UndoStore& Undo() { return m_undo; }
     Aggregate& Agg() { return m_agg; }
+    Prevalidated& Pre() { return m_pre; }
+
+    /** Pre-validation threads (started by StartSwiftSyncPrevalidation); stopped before shutdown. */
+    std::vector<std::thread> m_pre_threads;
+    std::atomic<bool> m_pre_stop{false};
+    void StopPrevalidation();
 
     /** Whether block `height` must be connected the SwiftSync way. */
     bool Covers(int height) const { return !m_done && height > 0 && height <= m_hints.Height(); }
@@ -225,6 +264,7 @@ private:
     Hints m_hints;
     UndoStore m_undo;
     Aggregate m_agg;
+    Prevalidated m_pre;
     bool m_done{false};
     std::atomic<int64_t> m_pack_stored_at{0};
 };
