@@ -4777,6 +4777,7 @@ static RPCHelpMan loadblockpack()
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("truncated or corrupt block pack at block %u: %s", n, e.what()));
             }
             if (stored > 0) {
+                if (auto* const sw{swiftsync::g_swiftsync.get()}) sw->NotePackStored();
                 // Connect what can be connected now. One call at a time does it (activation can run long
                 // while blocks keep arriving); the others leave a note for it and return. Not on the
                 // scheduler thread: activation waits for the validation queue, which that thread drains.

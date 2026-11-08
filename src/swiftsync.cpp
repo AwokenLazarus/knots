@@ -275,8 +275,14 @@ UndoCoinsView::UndoCoinsView(CCoinsView* base, const CBlock& block, const CBlock
     }
     // Outputs created in this block and spent later in it are served by the connecting cache, so
     // they stay out of this view (else the BIP30 check would see them as already existing).
-    std::set<Txid> created;
-    for (const auto& tx : block.vtx) created.insert(tx->GetHash());
+    std::unordered_set<uint256, SaltedTxidHasher> created;
+    created.reserve(block.vtx.size());
+    size_t inputs{0};
+    for (const auto& tx : block.vtx) {
+        created.insert(tx->GetHash().ToUint256());
+        inputs += tx->vin.size();
+    }
+    m_spent.reserve(inputs);
     for (size_t i = 1; i < block.vtx.size(); ++i) {
         const CTransaction& tx{*block.vtx[i]};
         const CTxUndo& txundo{undo.vtxundo[i - 1]};
@@ -285,7 +291,7 @@ UndoCoinsView::UndoCoinsView(CCoinsView* base, const CBlock& block, const CBlock
             return;
         }
         for (size_t j = 0; j < tx.vin.size(); ++j) {
-            if (created.contains(tx.vin[j].prevout.hash)) continue;
+            if (created.contains(tx.vin[j].prevout.hash.ToUint256())) continue;
             // A block spending the same outpoint twice is invalid; let CheckTxInputs see the second
             // spend as missing by keeping only the first.
             m_spent.emplace(tx.vin[j].prevout, txundo.vprevout[j]);

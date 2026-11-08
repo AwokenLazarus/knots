@@ -33,8 +33,11 @@
 #include <uint256.h>
 #include <undo.h>
 #include <util/fs.h>
+#include <util/hasher.h>
 #include <util/result.h>
+#include <util/time.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -42,6 +45,8 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class CBlock;
@@ -162,10 +167,12 @@ public:
     bool Matches() const { return m_matches; }
     std::optional<Coin> GetCoin(const COutPoint& outpoint) const override;
     bool HaveCoin(const COutPoint& outpoint) const override;
-    const std::map<COutPoint, Coin>& Spent() const { return m_spent; }
+    const std::unordered_map<COutPoint, Coin, SaltedOutpointHasher>& Spent() const { return m_spent; }
 
 private:
-    std::map<COutPoint, Coin> m_spent;
+    // Hash maps, not trees: built and probed once per input of every block (measured: the tree
+    // version was most of the coin plumbing's cost on a phone).
+    std::unordered_map<COutPoint, Coin, SaltedOutpointHasher> m_spent;
     bool m_matches{true};
 };
 
@@ -203,11 +210,23 @@ public:
     /** Set when SwiftSync can't go on (e.g. the hints are for a block not on this chain); the app falls back. */
     std::string m_error;
 
+    /**
+     * Block packs (loadblockpack) bring blocks ahead of the tip. While they do, peers are asked only
+     * for the next PACK_PEER_WINDOW blocks above the tip (the gaps a late pack leaves), not the
+     * whole download window: else most blocks arrive twice, and each copy costs radio, decryption,
+     * parsing and a check before it's dropped.
+     */
+    static constexpr int PACK_PEER_WINDOW{64};
+    static constexpr int64_t PACK_FEED_SECONDS{120};
+    void NotePackStored() { m_pack_stored_at = GetTime(); }
+    bool PacksFeeding() const { return GetTime() - m_pack_stored_at.load() < PACK_FEED_SECONDS; }
+
 private:
     Hints m_hints;
     UndoStore m_undo;
     Aggregate m_agg;
     bool m_done{false};
+    std::atomic<int64_t> m_pack_stored_at{0};
 };
 
 /** Whether saved SwiftSync state (txdb key 'W') belongs to a sync that hasn't reached its terminal height. */

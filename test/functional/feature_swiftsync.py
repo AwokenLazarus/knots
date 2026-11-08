@@ -80,6 +80,12 @@ class SwiftSyncTest(BitcoinTestFramework):
         assert_equal(a["txouts"], b["txouts"])
         assert_equal(a["total_amount"], b["total_amount"])
 
+        self.log.info("undo data is written only for the last 288 blocks below the terminal height")
+        deep = hints["height"] - 288
+        assert_raises_rpc_error(-1, "Undo data not available", self.nodes[1].getblockstats, deep)
+        self.nodes[1].getblockstats(deep + 1)
+        self.nodes[1].getblockstats(hints["height"])
+
         self.log.info("the undo export writes one file per block that spends something")
         res = node0.exportswiftsyncundo("undo-export", hints["height"])
         spending = sum(1 for h in range(1, hints["height"] + 1)

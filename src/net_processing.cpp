@@ -1435,8 +1435,10 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
     // SwiftSync: blocks can arrive faster than their undo data, and the window above slides with
     // downloaded blocks, not the tip, so downloads would run ahead without limit. Blocks above the
     // tip can't be pruned, so on a phone that filled the disk. Keep them within a window of the tip.
+    // While block packs bring the blocks, peers only fill the gaps right above the tip.
     if (auto* const sw{swiftsync::g_swiftsync.get()}; sw && !sw->Done()) {
-        nWindowEnd = std::min(nWindowEnd, m_chainman.ActiveChain().Height() + int(BLOCK_DOWNLOAD_WINDOW));
+        const int window{sw->PacksFeeding() ? swiftsync::SwiftSync::PACK_PEER_WINDOW : int(BLOCK_DOWNLOAD_WINDOW)};
+        nWindowEnd = std::min(nWindowEnd, m_chainman.ActiveChain().Height() + window);
     }
 
     FindNextBlocks(vBlocks, peer, state, pindexWalk, count, nWindowEnd, &m_chainman.ActiveChain(), &nodeStaller);

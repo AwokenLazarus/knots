@@ -3128,7 +3128,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return true;
     }
 
-    if (!m_blockman.WriteBlockUndo(blockundo, state, *pindex)) {
+    // SwiftSync: below the terminal height blocks can't be disconnected against the partial UTXO
+    // set anyway, and the undo data is only needed for a reorg after SwiftSync finishes. Keep it
+    // for the last MIN_BLOCKS_TO_KEEP blocks below the terminal height (the depth a pruned node
+    // can reorg) and skip writing it for deeper blocks: it was going to be pruned unread.
+    const auto* const sw{this == &m_chainman.ActiveChainstate() ? swiftsync::g_swiftsync.get() : nullptr};
+    const bool skip_undo{sw && sw->Covers(pindex->nHeight) && pindex->nHeight + int(MIN_BLOCKS_TO_KEEP) <= sw->GetHints().Height()};
+    if (!skip_undo && !m_blockman.WriteBlockUndo(blockundo, state, *pindex)) {
         return false;
     }
 
