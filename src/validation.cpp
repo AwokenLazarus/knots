@@ -75,6 +75,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <numeric>
 #include <optional>
@@ -3711,73 +3712,95 @@ bool PrevalidateScripts(const CBlock& block, const CBlockUndo& undo, int height,
 }
 } // namespace
 
+namespace {
+/** A block taken for pre-validation, with everything its check needs (gathered under cs_main). */
+struct PreJob {
+    uint256 hash;
+    int height;
+    FlatFilePos pos;
+    unsigned int flags;
+    int reduced_data_start_height;
+    CBlockUndo undo;
+};
+struct PreQueue {
+    Mutex mutex;
+    std::condition_variable cv;
+    std::deque<PreJob> jobs GUARDED_BY(mutex);
+};
+} // namespace
+
 void StartSwiftSyncPrevalidation(ChainstateManager& chainman, int threads)
 {
     auto* const sw{swiftsync::g_swiftsync.get()};
     if (!sw || sw->Done() || threads <= 0) return;
-    // Blocks taken by a worker and not yet finished; shared by the workers.
-    auto claimed{std::make_shared<std::pair<Mutex, std::set<uint256>>>()};
-    for (int t = 0; t < threads; ++t) {
-        sw->m_pre_threads.emplace_back([&chainman, sw, claimed, t] {
-            util::ThreadRename(strprintf("swiftpre.%i", t));
-            while (!sw->m_pre_stop && !sw->Done()) {
-                // Pick the lowest block above the tip that has its data and undo data and isn't done.
-                std::optional<uint256> hash;
-                int height{0};
-                FlatFilePos pos;
-                unsigned int flags{0};
-                int reduced_data_start_height{0};
-                CBlockUndo undo;
-                {
-                    LOCK(cs_main);
-                    Chainstate& active{chainman.ActiveChainstate()};
-                    const CBlockIndex* best{chainman.m_best_header};
-                    const int tip{active.m_chain.Height()};
-                    if (best) {
-                        const int top{std::min({best->nHeight, tip + PREVALIDATE_LOOKAHEAD, sw->GetHints().Height()})};
-                        for (int h = tip + 1; h <= top && !hash; ++h) {
-                            const CBlockIndex* p{best->GetAncestor(h)};
-                            if (!p || !(p->nStatus & BLOCK_HAVE_DATA) || p->nTx <= 1) continue;
-                            const uint256 bh{p->GetBlockHash()};
-                            if (sw->Pre().Has(bh) || !sw->Undo().Have(bh)) continue;
-                            {
-                                LOCK(claimed->first);
-                                if (!claimed->second.insert(bh).second) continue;
-                            }
-                            if (!sw->Undo().Read(bh, undo)) {
-                                LOCK(claimed->first);
-                                claimed->second.erase(bh);
-                                continue;
-                            }
-                            hash = bh;
-                            height = h;
-                            pos = p->GetBlockPos();
-                            flags = GetBlockScriptFlags(*p, chainman);
-                            const auto& consensus{chainman.GetParams().GetConsensus()};
-                            reduced_data_start_height = consensus.RdtsActiveAt(h, Assert(p->pprev)->GetMedianTimePast())
-                                ? consensus.RdtsActivationHeight() : 0;
+    auto queue{std::make_shared<PreQueue>()};
+    // The feeder takes cs_main briefly to queue the next blocks; workers never take it, so a block
+    // connecting (which holds cs_main, and may wait for a worker) doesn't idle the other workers.
+    sw->m_pre_threads.emplace_back([&chainman, sw, queue, threads] {
+        util::ThreadRename("swiftpre.feed");
+        const size_t want{size_t(2 * threads)};
+        while (!sw->m_pre_stop && !sw->Done()) {
+            size_t queued{WITH_LOCK(queue->mutex, return queue->jobs.size())};
+            std::vector<PreJob> found;
+            if (queued < want) {
+                LOCK(cs_main);
+                const CBlockIndex* best{chainman.m_best_header};
+                const int tip{chainman.ActiveChain().Height()};
+                if (best) {
+                    const int top{std::min({best->nHeight, tip + PREVALIDATE_LOOKAHEAD, sw->GetHints().Height()})};
+                    for (int h = tip + 1; h <= top && queued + found.size() < want; ++h) {
+                        const CBlockIndex* p{best->GetAncestor(h)};
+                        if (!p || !(p->nStatus & BLOCK_HAVE_DATA) || p->nTx <= 1) continue;
+                        const uint256 bh{p->GetBlockHash()};
+                        if (!sw->Undo().Have(bh) || !sw->Pre().Claim(bh)) continue;
+                        PreJob job{bh, h, p->GetBlockPos(), GetBlockScriptFlags(*p, chainman), 0, {}};
+                        if (!sw->Undo().Read(bh, job.undo)) {
+                            sw->Pre().Forget(bh);
+                            continue;
                         }
+                        const auto& consensus{chainman.GetParams().GetConsensus()};
+                        if (consensus.RdtsActiveAt(h, Assert(p->pprev)->GetMedianTimePast())) {
+                            job.reduced_data_start_height = consensus.RdtsActivationHeight();
+                        }
+                        found.push_back(std::move(job));
                     }
                 }
-                if (!hash) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
-                    continue;
+            }
+            if (found.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                continue;
+            }
+            {
+                LOCK(queue->mutex);
+                for (auto& j : found) queue->jobs.push_back(std::move(j));
+            }
+            queue->cv.notify_all();
+        }
+        queue->cv.notify_all();
+    });
+    for (int t = 0; t < threads; ++t) {
+        sw->m_pre_threads.emplace_back([&chainman, sw, queue, t] {
+            util::ThreadRename(strprintf("swiftpre.%i", t));
+            while (true) {
+                std::optional<PreJob> job;
+                {
+                    WAIT_LOCK(queue->mutex, lock);
+                    queue->cv.wait_for(lock, std::chrono::milliseconds{200}, [&]() EXCLUSIVE_LOCKS_REQUIRED(queue->mutex) {
+                        return !queue->jobs.empty() || sw->m_pre_stop || sw->Done();
+                    });
+                    if (sw->m_pre_stop || sw->Done()) return;
+                    if (queue->jobs.empty()) continue;
+                    job = std::move(queue->jobs.front());
+                    queue->jobs.pop_front();
                 }
+                if (!sw->Pre().Wanted(job->hash)) continue; // the tip got there first
                 CBlock block;
-                const bool ok{chainman.m_blockman.ReadBlock(block, pos, *hash) &&
-                              PrevalidateScripts(block, undo, height, flags, reduced_data_start_height,
+                const bool ok{chainman.m_blockman.ReadBlock(block, job->pos, job->hash) &&
+                              PrevalidateScripts(block, job->undo, job->height, job->flags, job->reduced_data_start_height,
                                                  chainman.m_validation_cache.m_signature_cache, sw->m_pre_stop)};
-                if (ok) {
-                    sw->Pre().Add(*hash, swiftsync::UndoHash(undo));
-                    ++sw->Pre().m_checked;
-                } else if (!sw->m_pre_stop) {
-                    ++sw->Pre().m_failed;
-                }
-                // A failed block stays claimed: it isn't tried again; it is checked in full when it connects.
-                if (ok) {
-                    LOCK(claimed->first);
-                    claimed->second.erase(*hash);
-                }
+                if (sw->m_pre_stop) return;
+                ++(ok ? sw->Pre().m_checked : sw->Pre().m_failed);
+                sw->Pre().Finish(job->hash, ok, swiftsync::UndoHash(job->undo));
             }
         });
     }
@@ -3912,10 +3935,11 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         // Scripts already checked ahead of the tip against exactly this undo data are not checked again.
         bool prechecked{false};
         if (swift && blockConnecting.vtx.size() > 1) {
-            prechecked = sw->Pre().Take(pindexNew->GetBlockHash(), swiftsync::UndoHash(swift_undo));
+            prechecked = sw->Pre().Connecting(pindexNew->GetBlockHash(), swiftsync::UndoHash(swift_undo));
             ++(prechecked ? sw->Pre().m_hits : sw->Pre().m_misses);
         }
         bool rv = ConnectBlock(blockConnecting, state, pindexNew, view, /*fJustCheck=*/false, /*scripts_checked=*/prechecked);
+        if (swift) sw->Pre().Forget(pindexNew->GetBlockHash());
         // A SwiftSync failure may be the served undo data's fault, not the block's: don't report it
         // as a bad block (that would punish the peer that sent the block).
         if (m_chainman.m_options.signals && (rv || !swift)) {

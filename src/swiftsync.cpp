@@ -319,32 +319,59 @@ uint256 UndoHash(const CBlockUndo& undo)
     return hw.GetSHA256();
 }
 
-void Prevalidated::Add(const uint256& block, const uint256& undo)
+bool Prevalidated::Claim(const uint256& block)
 {
     LOCK(m_mutex);
-    m_ok[block] = undo;
+    return m_entries.emplace(block, Entry{State::CHECKING, {}}).second;
 }
 
-bool Prevalidated::Take(const uint256& block, const uint256& undo)
+void Prevalidated::Finish(const uint256& block, bool ok, const uint256& undo)
 {
-    LOCK(m_mutex);
-    auto it{m_ok.find(block)};
-    if (it == m_ok.end()) return false;
-    const bool match{it->second == undo};
-    m_ok.erase(it);
-    return match;
+    {
+        LOCK(m_mutex);
+        auto it{m_entries.find(block)};
+        if (it == m_entries.end() || it->second.state != State::CHECKING) return;
+        it->second = Entry{ok ? State::PASSED : State::FAILED, undo};
+    }
+    m_cv.notify_all();
 }
 
-bool Prevalidated::Has(const uint256& block) const
+bool Prevalidated::Connecting(const uint256& block, const uint256& undo)
+{
+    WAIT_LOCK(m_mutex, lock);
+    auto it{m_entries.find(block)};
+    if (it != m_entries.end() && it->second.state == State::CHECKING) {
+        ++m_waited;
+        // A worker checks one block in well under a minute even on a phone; the bound only keeps a
+        // stuck worker from stalling the chain.
+        m_cv.wait_for(lock, std::chrono::seconds{60}, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+            auto e{m_entries.find(block)};
+            return e == m_entries.end() || e->second.state != State::CHECKING;
+        });
+        it = m_entries.find(block);
+    }
+    const bool passed{it != m_entries.end() && it->second.state == State::PASSED && it->second.undo == undo};
+    m_entries.insert_or_assign(block, Entry{State::CONNECTING, {}});
+    return passed;
+}
+
+bool Prevalidated::Wanted(const uint256& block) const
 {
     LOCK(m_mutex);
-    return m_ok.contains(block);
+    auto it{m_entries.find(block)};
+    return it != m_entries.end() && it->second.state == State::CHECKING;
+}
+
+void Prevalidated::Forget(const uint256& block)
+{
+    LOCK(m_mutex);
+    m_entries.erase(block);
 }
 
 size_t Prevalidated::Size() const
 {
     LOCK(m_mutex);
-    return m_ok.size();
+    return m_entries.size();
 }
 
 void SwiftSync::StopPrevalidation()

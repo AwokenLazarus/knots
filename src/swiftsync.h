@@ -38,6 +38,7 @@
 #include <util/time.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -192,20 +193,36 @@ uint256 UndoHash(const CBlockUndo& undo);
 class Prevalidated
 {
 public:
-    void Add(const uint256& block, const uint256& undo) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    /** Whether `block` passed with this undo data; forgets it either way. */
-    bool Take(const uint256& block, const uint256& undo) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool Has(const uint256& block) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    /** A worker takes `block` to check; false if it is taken, done, or already being connected. */
+    bool Claim(const uint256& block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    /** A worker's result for a block it claimed. */
+    void Finish(const uint256& block, bool ok, const uint256& undo) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    /**
+     * The block is about to connect: waits for a worker still checking it (so no block is checked
+     * twice), then answers whether it passed with exactly this undo data. Afterwards no worker takes
+     * it; Forget() drops the entry once the block is connected.
+     */
+    bool Connecting(const uint256& block, const uint256& undo) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void Forget(const uint256& block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    /** Whether a worker should still check `block` (claimed and not yet reached by the tip). */
+    bool Wanted(const uint256& block) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     size_t Size() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     std::atomic<uint64_t> m_checked{0}; //!< blocks whose scripts all passed
     std::atomic<uint64_t> m_failed{0};  //!< blocks a script failed in (checked again when they connect)
     std::atomic<uint64_t> m_hits{0};    //!< blocks connected without checking their scripts again
     std::atomic<uint64_t> m_misses{0};  //!< blocks connected with full script checks
+    std::atomic<uint64_t> m_waited{0};  //!< connects that waited for a worker to finish the block
 
 private:
+    enum class State { CHECKING, PASSED, FAILED, CONNECTING };
+    struct Entry {
+        State state;
+        uint256 undo;
+    };
     mutable Mutex m_mutex;
-    std::map<uint256, uint256> m_ok GUARDED_BY(m_mutex);
+    std::condition_variable m_cv;
+    std::map<uint256, Entry> m_entries GUARDED_BY(m_mutex);
 };
 
 /** The node's SwiftSync state: active from startup with -swiftsync until the terminal height. */

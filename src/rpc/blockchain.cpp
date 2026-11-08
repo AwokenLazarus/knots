@@ -4479,6 +4479,7 @@ static RPCHelpMan getswiftsyncinfo()
             {RPCResult::Type::NUM, "pre_failed", /*optional=*/true, "blocks pre-validation found a failing script in (checked in full when they connect)"},
             {RPCResult::Type::NUM, "pre_hits", /*optional=*/true, "blocks connected without checking their scripts again"},
             {RPCResult::Type::NUM, "pre_misses", /*optional=*/true, "blocks connected with full script checks"},
+            {RPCResult::Type::NUM, "pre_waited", /*optional=*/true, "connects that waited for a worker still checking the block"},
             {RPCResult::Type::NUM, "undo_failures", /*optional=*/true, "blocks whose served undo data failed and was fetched again"},
             {RPCResult::Type::STR, "error", /*optional=*/true, "why SwiftSync can't go on, if it can't (fall back to an ordinary sync)"},
         }},
@@ -4498,6 +4499,7 @@ static RPCHelpMan getswiftsyncinfo()
                 ret.pushKV("pre_failed", sw->Pre().m_failed.load());
                 ret.pushKV("pre_hits", sw->Pre().m_hits.load());
                 ret.pushKV("pre_misses", sw->Pre().m_misses.load());
+                ret.pushKV("pre_waited", sw->Pre().m_waited.load());
                 ret.pushKV("undo_failures", uint64_t(sw->m_undo_failures.size()));
                 if (!sw->m_error.empty()) ret.pushKV("error", sw->m_error);
             }
